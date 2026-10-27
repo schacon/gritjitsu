@@ -45,7 +45,14 @@ use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::stream;
 use gix::refspec::Instruction;
+use grit_lib::index::Index as GitIndex;
+use grit_lib::index::IndexEntry;
+use grit_lib::index::MODE_EXECUTABLE;
+use grit_lib::index::MODE_GITLINK;
+use grit_lib::index::MODE_REGULAR;
+use grit_lib::index::MODE_SYMLINK;
 use grit_lib::objects::ObjectId as GitOid;
+use grit_lib::objects::ObjectKind;
 use grit_lib::refs::store::Expected;
 use grit_lib::refs::store::RawRef;
 use grit_lib::refs::store::RefStoreError;
@@ -2094,9 +2101,6 @@ pub async fn reset_head(
     wc_commit: &Commit,
 ) -> Result<(), GitResetHeadError> {
     let git_backend = get_git_backend(mut_repo.store())?;
-    let git_repo = git_backend
-        .open_git_repo_at_workdir(workspace_root)
-        .map_err(GitResetHeadError::from_git)?;
     let grit_repo = git_backend
         .open_grit_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
@@ -2139,7 +2143,7 @@ pub async fn reset_head(
         clear_operation_state(&grit_repo)?;
     }
 
-    reset_index(mut_repo, &git_repo, wc_commit).await
+    reset_index(mut_repo, &grit_repo, wc_commit).await
 }
 
 fn clear_operation_state(git_repo: &GritRepository) -> Result<(), GitResetHeadError> {
@@ -2176,7 +2180,7 @@ fn clear_operation_state(git_repo: &GritRepository) -> Result<(), GitResetHeadEr
 
 async fn reset_index(
     repo: &dyn Repo,
-    git_repo: &gix::Repository,
+    git_repo: &GritRepository,
     wc_commit: &Commit,
 ) -> Result<(), GitResetHeadError> {
     let parent_tree = wc_commit.parent_tree(repo.index()).await?;
@@ -2184,21 +2188,9 @@ async fn reset_index(
     // same changes as `jj diff`. If the merged parent tree has conflicts, then the
     // Git index will also be conflicted.
     let mut index = if let Some(tree_id) = parent_tree.tree_ids().as_resolved() {
-        if tree_id == repo.store().empty_tree_id() {
-            // If the tree is empty, gix can fail to load the object (since Git doesn't
-            // require the empty tree to actually be present in the object database), so we
-            // just use an empty index directly.
-            gix::index::File::from_state(
-                gix::index::State::new(git_repo.object_hash()),
-                git_repo.index_path(),
-            )
-        } else {
-            // If the parent tree is resolved, we can use gix's `index_from_tree` method.
-            // This is more efficient than iterating over the tree and adding each entry.
-            git_repo
-                .index_from_tree(&gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()))
-                .map_err(GitResetHeadError::from_git)?
-        }
+        // If the parent tree is resolved, read the Git tree directly. This is
+        // more efficient than iterating over the merged tree.
+        build_index_from_tree(git_repo, &to_git_oid(tree_id))?
     } else {
         build_index_from_merged_tree(git_repo, &parent_tree).await?
     };
@@ -2208,76 +2200,152 @@ async fn reset_index(
 
     // Match entries in the new index with entries in the old index, and copy stat
     // information if the entry didn't change.
-    if let Some(old_index) = git_repo.try_index().map_err(GitResetHeadError::from_git)? {
-        index
-            .entries_mut_with_paths()
-            .merge_join_by(old_index.entries(), |(entry, path), old_entry| {
-                gix::index::Entry::cmp_filepaths(path, old_entry.path(&old_index))
-                    .then_with(|| entry.stage().cmp(&old_entry.stage()))
-            })
-            .filter_map(|merged| merged.both())
-            .map(|((entry, _), old_entry)| (entry, old_entry))
-            .filter(|(entry, old_entry)| entry.id == old_entry.id && entry.mode == old_entry.mode)
-            .for_each(|(entry, old_entry)| entry.stat = old_entry.stat);
-    }
-
-    debug_assert!(index.verify_entries().is_ok());
-
+    let old_index = git_repo
+        .index_handle()
+        .load()
+        .map_err(GitResetHeadError::from_git)?;
     index
-        .write(gix::index::write::Options::default())
+        .entries_mut()
+        .iter_mut()
+        .merge_join_by(old_index.entries(), |entry, old_entry| {
+            (entry.path.as_slice(), entry.stage())
+                .cmp(&(old_entry.path.as_slice(), old_entry.stage()))
+        })
+        .filter_map(|merged| merged.both())
+        .filter(|(entry, old_entry)| entry.oid == old_entry.oid && entry.mode == old_entry.mode)
+        .for_each(|(entry, old_entry)| copy_index_stat(entry, old_entry));
+
+    git_repo
+        .index_handle()
+        .write(&mut index)
         .map_err(GitResetHeadError::from_git)
 }
 
+/// Creates an empty index for `git_repo`.
+fn new_index(git_repo: &GritRepository) -> GitIndex {
+    let mut index = GitIndex::new();
+    index.hash_algo = git_repo.odb().hash_algo();
+    index
+}
+
+fn new_index_entry(path: Vec<u8>, oid: GitOid, mode: u32, stage: u8) -> IndexEntry {
+    IndexEntry {
+        ctime_sec: 0,
+        ctime_nsec: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        oid,
+        // The writer fills in the path length and extended bits.
+        flags: u16::from(stage) << 12,
+        flags_extended: None,
+        path,
+        base_index_pos: 0,
+    }
+}
+
+fn copy_index_stat(entry: &mut IndexEntry, old_entry: &IndexEntry) {
+    entry.ctime_sec = old_entry.ctime_sec;
+    entry.ctime_nsec = old_entry.ctime_nsec;
+    entry.mtime_sec = old_entry.mtime_sec;
+    entry.mtime_nsec = old_entry.mtime_nsec;
+    entry.dev = old_entry.dev;
+    entry.ino = old_entry.ino;
+    entry.uid = old_entry.uid;
+    entry.gid = old_entry.gid;
+    entry.size = old_entry.size;
+}
+
+/// Sorts index entries after they were pushed out of order.
+fn sort_index(index: &mut GitIndex) {
+    index.mark_entries_unsorted();
+    index.sort();
+}
+
+/// Builds an unconflicted index with the contents of the Git tree `tree_id`.
+fn build_index_from_tree(
+    git_repo: &GritRepository,
+    tree_id: &GitOid,
+) -> Result<GitIndex, GitResetHeadError> {
+    fn add_tree(
+        git_repo: &GritRepository,
+        tree_id: &GitOid,
+        prefix: &[u8],
+        entries: &mut Vec<IndexEntry>,
+    ) -> Result<(), GritError> {
+        if git_repo.odb().is_empty_tree(tree_id) {
+            return Ok(());
+        }
+        let data = git_repo.odb().read(tree_id)?.data;
+        let oid_len = git_repo.odb().hash_algo().len();
+        for entry in grit_lib::objects::TreeRefIter::with_oid_len(&data, oid_len) {
+            let entry = entry?;
+            let mut path = prefix.to_vec();
+            path.extend_from_slice(entry.name);
+            if entry.mode == 0o040000 {
+                path.push(b'/');
+                add_tree(git_repo, &entry.oid, &path, entries)?;
+            } else {
+                entries.push(new_index_entry(path, entry.oid, entry.mode, 0));
+            }
+        }
+        Ok(())
+    }
+
+    let mut index = new_index(git_repo);
+    add_tree(git_repo, tree_id, b"", index.entries_mut()).map_err(GitResetHeadError::from_git)?;
+    // Tree entries are sorted as if directory names had a trailing "/".
+    sort_index(&mut index);
+    Ok(index)
+}
+
 async fn build_index_from_merged_tree(
-    git_repo: &gix::Repository,
+    git_repo: &GritRepository,
     merged_tree: &MergedTree,
-) -> Result<gix::index::File, GitResetHeadError> {
-    let mut index = gix::index::File::from_state(
-        gix::index::State::new(git_repo.object_hash()),
-        git_repo.index_path(),
-    );
+) -> Result<GitIndex, GitResetHeadError> {
+    let mut index = new_index(git_repo);
 
-    let mut push_index_entry =
-        |path: &RepoPath, maybe_entry: &Option<TreeValue>, stage: gix::index::entry::Stage| {
-            let Some(entry) = maybe_entry else {
-                return;
-            };
-
-            let (id, mode) = match entry {
-                TreeValue::File {
-                    id,
-                    executable,
-                    copy_id: _,
-                } => {
-                    if *executable {
-                        (id.as_bytes(), gix::index::entry::Mode::FILE_EXECUTABLE)
-                    } else {
-                        (id.as_bytes(), gix::index::entry::Mode::FILE)
-                    }
-                }
-                TreeValue::Symlink(id) => (id.as_bytes(), gix::index::entry::Mode::SYMLINK),
-                TreeValue::Tree(_) => {
-                    // This case is only possible if there is a file-directory conflict, since
-                    // `MergedTree::entries` handles the recursion otherwise. We only
-                    // materialize a file in the working copy for file-directory conflicts, so we
-                    // don't add the tree to the index here either.
-                    return;
-                }
-                TreeValue::GitSubmodule(id) => (id.as_bytes(), gix::index::entry::Mode::COMMIT),
-            };
-
-            let path = BStr::new(path.as_internal_file_string());
-
-            // It is safe to push the entry because we ensure that we only add each path to
-            // a stage once, and we sort the entries after we finish adding them.
-            index.dangerously_push_entry(
-                gix::index::entry::Stat::default(),
-                gix::ObjectId::from_bytes_or_panic(id),
-                gix::index::entry::Flags::from_stage(stage),
-                mode,
-                path,
-            );
+    let mut push_index_entry = |path: &RepoPath, maybe_entry: &Option<TreeValue>, stage: u8| {
+        let Some(entry) = maybe_entry else {
+            return;
         };
+
+        let (id, mode) = match entry {
+            TreeValue::File {
+                id,
+                executable,
+                copy_id: _,
+            } => {
+                if *executable {
+                    (id.as_bytes(), MODE_EXECUTABLE)
+                } else {
+                    (id.as_bytes(), MODE_REGULAR)
+                }
+            }
+            TreeValue::Symlink(id) => (id.as_bytes(), MODE_SYMLINK),
+            TreeValue::Tree(_) => {
+                // This case is only possible if there is a file-directory conflict, since
+                // `MergedTree::entries` handles the recursion otherwise. We only
+                // materialize a file in the working copy for file-directory conflicts, so we
+                // don't add the tree to the index here either.
+                return;
+            }
+            TreeValue::GitSubmodule(id) => (id.as_bytes(), MODE_GITLINK),
+        };
+
+        let path = path.as_internal_file_string().as_bytes().to_vec();
+        let oid = GitOid::from_bytes(id).expect("object id should have valid length");
+        // We only add each path to a stage once, and we sort the entries after
+        // we finish adding them.
+        index
+            .entries_mut()
+            .push(new_index_entry(path, oid, mode, stage));
+    };
 
     let mut has_many_sided_conflict = false;
 
@@ -2285,16 +2353,16 @@ async fn build_index_from_merged_tree(
     while let Some((path, entry)) = entries.next().await {
         let entry = entry?;
         if let Some(resolved) = entry.as_resolved() {
-            push_index_entry(&path, resolved, gix::index::entry::Stage::Unconflicted);
+            push_index_entry(&path, resolved, 0);
             continue;
         }
 
         let conflict = entry.simplify();
         if let [left, base, right] = conflict.as_slice() {
             // 2-sided conflicts can be represented in the Git index
-            push_index_entry(&path, left, gix::index::entry::Stage::Ours);
-            push_index_entry(&path, base, gix::index::entry::Stage::Base);
-            push_index_entry(&path, right, gix::index::entry::Stage::Theirs);
+            push_index_entry(&path, left, 2);
+            push_index_entry(&path, base, 1);
+            push_index_entry(&path, right, 3);
         } else {
             // We can't represent many-sided conflicts in the Git index, so just add the
             // first side as staged. This is preferable to adding the first 2 sides as a
@@ -2304,40 +2372,32 @@ async fn build_index_from_merged_tree(
             // a file named ".jj-do-not-resolve-this-conflict" to prevent the user from
             // accidentally committing the conflict markers.
             has_many_sided_conflict = true;
-            push_index_entry(
-                &path,
-                conflict.first(),
-                gix::index::entry::Stage::Unconflicted,
-            );
+            push_index_entry(&path, conflict.first(), 0);
         }
     }
 
-    // Required after `dangerously_push_entry` for correctness. We use do a lookup
-    // in the index after this, so it must be sorted before we do the lookup.
-    index.sort_entries();
+    // We use do a lookup in the index after this, so it must be sorted.
+    sort_index(&mut index);
 
     // If the conflict had an unrepresentable conflict and the dummy file path isn't
     // already added in the index, add a dummy file as a conflict.
-    if has_many_sided_conflict
-        && index
-            .entry_index_by_path(INDEX_DUMMY_CONFLICT_FILE.into())
-            .is_err()
-    {
+    if has_many_sided_conflict && !index_has_path(&index, INDEX_DUMMY_CONFLICT_FILE.as_bytes()) {
         let file_blob = git_repo
-            .write_blob(
+            .odb()
+            .write(
+                ObjectKind::Blob,
                 b"The working copy commit contains conflicts which cannot be resolved using Git.\n",
             )
             .map_err(GitResetHeadError::from_git)?;
-        index.dangerously_push_entry(
-            gix::index::entry::Stat::default(),
-            file_blob.detach(),
-            gix::index::entry::Flags::from_stage(gix::index::entry::Stage::Ours),
-            gix::index::entry::Mode::FILE,
-            INDEX_DUMMY_CONFLICT_FILE.into(),
-        );
+        index.entries_mut().push(new_index_entry(
+            INDEX_DUMMY_CONFLICT_FILE.as_bytes().to_vec(),
+            file_blob,
+            MODE_REGULAR,
+            2,
+        ));
         // We need to sort again for correctness before writing the index file since we
         // added a new entry.
-        index.sort_entries();
+        sort_index(&mut index);
     }
 
     Ok(index)
@@ -2357,24 +2417,31 @@ pub async fn update_intent_to_add(
 ) -> Result<(), GitResetHeadError> {
     let git_backend = get_git_backend(repo.store())?;
     let git_repo = git_backend
-        .open_git_repo_at_workdir(workspace_root)
+        .open_grit_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
     let mut index = git_repo
-        .index_or_empty()
+        .index_handle()
+        .load()
         .map_err(GitResetHeadError::from_git)?;
-    let mut_index = Arc::make_mut(&mut index);
-    update_intent_to_add_impl(&git_repo, mut_index, old_tree, new_tree).await?;
-    debug_assert!(mut_index.verify_entries().is_ok());
-    mut_index
-        .write(gix::index::write::Options::default())
+    update_intent_to_add_impl(&git_repo, &mut index, old_tree, new_tree).await?;
+    git_repo
+        .index_handle()
+        .write(&mut index)
         .map_err(GitResetHeadError::from_git)?;
-
     Ok(())
 }
 
+/// Returns whether `index`, which must be sorted, has an entry for `path` at
+/// any stage.
+fn index_has_path(index: &GitIndex, path: &[u8]) -> bool {
+    let entries = index.entries();
+    let pos = entries.partition_point(|entry| entry.path.as_slice() < path);
+    entries.get(pos).is_some_and(|entry| entry.path == path)
+}
+
 async fn update_intent_to_add_impl(
-    git_repo: &gix::Repository,
-    index: &mut gix::index::File,
+    git_repo: &GritRepository,
+    index: &mut GitIndex,
     old_tree: &MergedTree,
     new_tree: &MergedTree,
 ) -> Result<(), GitResetHeadError> {
@@ -2395,14 +2462,12 @@ async fn update_intent_to_add_impl(
                     continue;
                 }
             };
-            if index
-                .entry_index_by_path(BStr::new(path.as_internal_file_string()))
-                .is_err()
-            {
-                added_paths.push((BString::from(path.into_internal_string()), executable));
+            let path = path.into_internal_string().into_bytes();
+            if !index_has_path(index, &path) {
+                added_paths.push((path, executable));
             }
         } else if values.after.is_absent() {
-            removed_paths.insert(BString::from(path.into_internal_string()));
+            removed_paths.insert(path.into_internal_string().into_bytes());
         }
     }
 
@@ -2413,45 +2478,36 @@ async fn update_intent_to_add_impl(
     if !added_paths.is_empty() {
         // We need to write the empty blob, otherwise `jj util gc` will report an error.
         let empty_blob = git_repo
-            .write_blob(b"")
-            .map_err(GitResetHeadError::from_git)?
-            .detach();
+            .odb()
+            .write(ObjectKind::Blob, b"")
+            .map_err(GitResetHeadError::from_git)?;
         for (path, executable) in added_paths {
             // We have checked that the index doesn't have this entry
-            index.dangerously_push_entry(
-                gix::index::entry::Stat::default(),
-                empty_blob,
-                gix::index::entry::Flags::INTENT_TO_ADD | gix::index::entry::Flags::EXTENDED,
-                if executable {
-                    gix::index::entry::Mode::FILE_EXECUTABLE
-                } else {
-                    gix::index::entry::Mode::FILE
-                },
-                path.as_ref(),
-            );
+            let mode = if executable {
+                MODE_EXECUTABLE
+            } else {
+                MODE_REGULAR
+            };
+            let mut entry = new_index_entry(path, empty_blob, mode, 0);
+            entry.set_intent_to_add(true);
+            index.entries_mut().push(entry);
         }
     }
     if !removed_paths.is_empty() {
-        index.remove_entries(|_size, path, entry| {
-            entry
-                .flags
-                .contains(gix::index::entry::Flags::INTENT_TO_ADD)
-                && removed_paths.contains(path)
-        });
+        index
+            .entries_mut()
+            .retain(|entry| !(entry.intent_to_add() && removed_paths.contains(&entry.path)));
     }
 
-    index.sort_entries();
+    sort_index(index);
 
-    // The entry mutations above (`dangerously_push_entry`, `remove_entries`,
-    // `sort_entries`) do not invalidate the cache-tree (TREE) extension loaded
-    // from disk, and `gix::index::File::write()` re-emits it as-is. Its own
-    // docs prescribe this discard: "Until the tree-cache is updated on write
-    // (see gitoxide#2421), remove it with `State::remove_tree()` before writing
-    // whenever entries were changed." Otherwise the written index carries a
-    // stale, under-counted cache-tree; an external `git add` that later
-    // rebuilds it trusts those child counts and emits a doubled subtree entry,
-    // which `git fsck` reports as duplicateEntries.
-    index.remove_tree();
+    // The entry mutations above don't update the cache-tree (TREE) extension
+    // loaded from disk. Otherwise the written index carries a stale,
+    // under-counted cache-tree; an external `git add` that later rebuilds it
+    // trusts those child counts and emits a doubled subtree entry, which
+    // `git fsck` reports as duplicateEntries.
+    index.cache_tree = None;
+    index.cache_tree_root = None;
 
     Ok(())
 }

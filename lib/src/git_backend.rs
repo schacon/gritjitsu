@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -21,6 +22,7 @@ use std::fmt::Error;
 use std::fmt::Formatter;
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -38,9 +40,6 @@ use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
 use futures::io::Cursor;
 use futures::stream::BoxStream;
-use std::borrow::Cow;
-use std::ops::Range;
-
 use grit_lib::diff::DiffEntry;
 use grit_lib::diff::DiffStatus;
 use grit_lib::objects::HashAlgo;

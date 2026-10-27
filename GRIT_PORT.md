@@ -84,3 +84,7 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
   Deleting a ref also deletes its reflog, which grit leaves to callers. Three
   snapshots changed because they print the Git library's error message.
   Tests: 3491/3491.
+- **Step 6**: the Git index (`reset_head`, conflict stages, intent-to-add
+  entries) is built and written with grit-lib's `Index`. Resolved parent trees
+  are read straight from the Git tree, and stat data is carried over from the
+  old index for unchanged entries. Tests: 3491/3491.
