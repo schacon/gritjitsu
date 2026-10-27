@@ -34,7 +34,7 @@ dunce = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
 gix = { workspace = true, optional = true }
-gix-ignore = { workspace = true }
+grit-lib = { workspace = true }
 globset = { workspace = true }
 indexmap = { workspace = true }
 itertools = { workspace = true }

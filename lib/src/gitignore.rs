@@ -21,6 +21,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use grit_lib::worktree::ignore::IgnorePatternList;
 use thiserror::Error;
 
 use crate::repo_path::RepoPath;
@@ -36,7 +37,7 @@ pub enum GitIgnoreError {
 #[derive(Debug)]
 pub struct GitIgnoreFile {
     parent: Option<Arc<Self>>,
-    matcher: gix_ignore::Search,
+    matcher: IgnorePatternList,
     prefix: RepoPathBuf,
 }
 
@@ -44,7 +45,7 @@ impl GitIgnoreFile {
     pub fn empty() -> Arc<Self> {
         Arc::new(Self {
             parent: None,
-            matcher: gix_ignore::Search::default(),
+            matcher: IgnorePatternList::default(),
             prefix: RepoPathBuf::root(),
         })
     }
@@ -53,30 +54,14 @@ impl GitIgnoreFile {
     pub fn chain(
         self: &Arc<Self>,
         prefix: &RepoPath,
-        ignore_path: &Path,
+        _ignore_path: &Path,
         input: &[u8],
     ) -> Result<Arc<Self>, GitIgnoreError> {
-        // Construct the gix search object.
-        let mut matcher = gix_ignore::Search::default();
-        // Since we strip the path prefix manually in matches(), the root path
-        // shouldn't be set. add_patterns_buffer() expects filesystem path pairs
-        // e.g. ignore_path = "/repo/bar/.gitignore" and root = "/repo".
-        let root = None;
-        matcher
-            .add_patterns_buffer(
-                input,
-                ignore_path,
-                root,
-                gix_ignore::search::Ignore {
-                    support_precious: false,
-                },
-            )
-            .map_err(|source| GitIgnoreError::ReadFile {
-                path: ignore_path.to_owned(),
-                source,
-            })?;
+        // Since we strip the path prefix manually in matches(), the patterns
+        // are parsed relative to the root.
+        let matcher = IgnorePatternList::parse(input, "");
 
-        let parent = if self.matcher.patterns.is_empty() {
+        let parent = if self.matcher.is_empty() {
             self.parent.clone() // omit the empty root
         } else {
             Some(self.clone())
@@ -131,13 +116,11 @@ impl GitIgnoreFile {
             if let Some(relative_path) = path.strip_prefix(&file.prefix)
                 && !relative_path.is_root()
             {
-                let m = file.matcher.pattern_matching_relative_path(
-                    relative_path.as_internal_file_string().as_ref(),
-                    Some(is_dir),
-                    gix_ignore::glob::pattern::Case::Sensitive,
-                );
-                if let Some(m) = m {
-                    return !m.pattern.is_negative();
+                let ignored =
+                    file.matcher
+                        .is_ignored(relative_path.as_internal_file_string(), is_dir, false);
+                if let Some(ignored) = ignored {
+                    return ignored;
                 }
             }
         }

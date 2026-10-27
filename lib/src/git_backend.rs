@@ -38,12 +38,16 @@ use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
 use futures::io::Cursor;
 use futures::stream::BoxStream;
-use gix::bstr::BString;
-use gix::objs::CommitRefIter;
-use gix::objs::Exists as _;
-use gix::objs::Write as _;
-use gix::objs::WriteTo as _;
-use gix::objs::commit::signature_field_name;
+use std::borrow::Cow;
+use std::ops::Range;
+
+use grit_lib::objects::HashAlgo;
+use grit_lib::objects::ObjectId as GritObjectId;
+use grit_lib::objects::ObjectKind;
+use grit_lib::objects::TreeEntry as GritTreeEntry;
+use grit_lib::objects::TreeRefIter;
+use grit_lib::objects::serialize_tree;
+use grit_lib::objects::tree_entry_cmp;
 use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
@@ -110,6 +114,8 @@ pub enum GitBackendInitError {
     InitRepository(#[source] gix::Error),
     #[error("Failed to open git repository")]
     OpenRepository(#[source] gix::Error),
+    #[error("Failed to open git repository")]
+    OpenGritRepository(#[source] grit_lib::error::Error),
     #[error("Failed to encode git repository path")]
     EncodeRepositoryPath(#[source] BadPathEncoding),
     #[error(transparent)]
@@ -128,6 +134,8 @@ impl From<Box<GitBackendInitError>> for BackendInitError {
 pub enum GitBackendLoadError {
     #[error("Failed to open git repository")]
     OpenRepository(#[source] gix::Error),
+    #[error("Failed to open git repository")]
+    OpenGritRepository(#[source] grit_lib::error::Error),
     #[error("Failed to decode git repository path")]
     DecodeRepositoryPath(#[source] BadPathEncoding),
     #[error(transparent)]
@@ -182,6 +190,7 @@ pub struct GitBackend {
     // used in a single-threaded context.
     base_repo: gix::ThreadSafeRepository,
     repo: Mutex<gix::Repository>,
+    grit_repo: grit_lib::repo::Repository,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -197,17 +206,19 @@ impl GitBackend {
 
     fn new(
         base_repo: gix::ThreadSafeRepository,
+        grit_repo: grit_lib::repo::Repository,
         extra_metadata_store: TableStore,
         git_settings: GitSettings,
     ) -> Self {
         let repo = base_repo.to_thread_local();
-        let root_commit_id = CommitId::from_bytes(repo.object_hash().null_ref().as_bytes());
+        let hash_algo = grit_repo.odb().hash_algo();
+        let root_commit_id = CommitId::from_bytes(GritObjectId::null(hash_algo).as_bytes());
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
-        let empty_tree_id =
-            TreeId::from_bytes(gix::ObjectId::empty_tree(repo.object_hash()).as_bytes());
+        let empty_tree_id = TreeId::from_bytes(empty_tree_oid(hash_algo).as_bytes());
         Self {
             base_repo,
             repo: Mutex::new(repo),
+            grit_repo,
             root_commit_id,
             root_change_id,
             empty_tree_id,
@@ -319,11 +330,10 @@ impl GitBackend {
         fs::write(&target_path, git_repo_path_bytes)
             .context(&target_path)
             .map_err(GitBackendInitError::Path)?;
-        let extra_metadata_store = TableStore::init(
-            extra_path,
-            repo.to_thread_local().object_hash().len_in_bytes(),
-        );
-        Ok(Self::new(repo, extra_metadata_store, git_settings))
+        let grit_repo =
+            open_grit_repo(repo.path()).map_err(GitBackendInitError::OpenGritRepository)?;
+        let extra_metadata_store = TableStore::init(extra_path, grit_repo.odb().hash_algo().len());
+        Ok(Self::new(repo, grit_repo, extra_metadata_store, git_settings))
     }
 
     pub fn load(
@@ -347,13 +357,13 @@ impl GitBackend {
             gix_open_opts_from_settings(settings),
         )
         .map_err(GitBackendLoadError::OpenRepository)?;
-        let extra_metadata_store = TableStore::load(
-            store_path.join("extra"),
-            repo.to_thread_local().object_hash().len_in_bytes(),
-        );
+        let grit_repo =
+            open_grit_repo(repo.path()).map_err(GitBackendLoadError::OpenGritRepository)?;
+        let extra_metadata_store =
+            TableStore::load(store_path.join("extra"), grit_repo.odb().hash_algo().len());
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendLoadError::Config)?;
-        Ok(Self::new(repo, extra_metadata_store, git_settings))
+        Ok(Self::new(repo, grit_repo, extra_metadata_store, git_settings))
     }
 
     fn lock_git_repo(&self) -> MutexGuard<'_, gix::Repository> {
@@ -412,22 +422,11 @@ impl GitBackend {
         self.base_repo.path()
     }
 
-    fn shallow_root_ids(&self, git_repo: &gix::Repository) -> BackendResult<&[CommitId]> {
-        // The list of shallow roots is cached by gix, but it's still expensive
-        // to stat file on every read_object() call. Refreshing shallow roots is
-        // also bad for consistency reasons.
+    fn shallow_root_ids(&self) -> BackendResult<&[CommitId]> {
+        // It's expensive to stat the shallow file on every read_object() call.
+        // Refreshing shallow roots is also bad for consistency reasons.
         self.shallow_root_ids
-            .get_or_try_init(|| {
-                let maybe_oids = git_repo
-                    .shallow_commits()
-                    .map_err(|err| BackendError::Other(err.into()))?;
-                let commit_ids = maybe_oids.map_or(vec![], |oids| {
-                    oids.iter()
-                        .map(|oid| CommitId::from_bytes(oid.as_bytes()))
-                        .collect()
-                });
-                Ok(commit_ids)
-            })
+            .get_or_try_init(|| read_shallow_root_ids(self.grit_repo.common_git_dir()))
             .map(AsRef::as_ref)
     }
 
@@ -502,25 +501,17 @@ impl GitBackend {
         let (table, table_lock) = self.read_extra_metadata_table_locked()?;
         let mut mut_table = table.start_mutation();
         import_extra_metadata_entries_from_heads(
-            &locked_repo,
+            &self.grit_repo,
             &mut mut_table,
             &table_lock,
             &head_ids,
-            self.shallow_root_ids(&locked_repo)?,
+            self.shallow_root_ids()?,
         )?;
         self.save_extra_metadata_table(mut_table, &table_lock)
     }
 
     fn read_file_sync(&self, id: &FileId) -> BackendResult<Vec<u8>> {
-        let locked_repo = self.lock_git_repo();
-        let git_blob_id = validate_git_object_id(&locked_repo, id)?;
-        let mut blob = locked_repo
-            .try_find_object(git_blob_id)
-            .map_err(|err| to_read_object_err(err, id))?
-            .ok_or_else(|| not_found_err(id))?
-            .try_into_blob()
-            .map_err(|err| to_read_object_err(err, id))?;
-        Ok(blob.take_data())
+        read_object_of_kind(&self.grit_repo, id, ObjectKind::Blob)
     }
 
     fn new_diff_platform(&self) -> BackendResult<gix::diff::blob::Platform> {
@@ -559,7 +550,7 @@ impl GitBackend {
         let tree = self.read_commit(id).block_on()?.root_tree;
         // TODO(kfm): probably want to do something here if it is a merge
         let tree_id = tree.first();
-        let gix_id = validate_git_object_id(repo, tree_id)?;
+        let gix_id = validate_gix_object_id(repo, tree_id)?;
         repo.try_find_object(gix_id)
             .map_err(|err| to_read_object_err(err, tree_id))?
             .ok_or_else(|| not_found_err(tree_id))?
@@ -567,37 +558,8 @@ impl GitBackend {
             .map_err(|err| to_read_object_err(err, tree_id))
     }
 
-    // Similar to gix's write_blob, but compute the hash outside our lock to
-    // reduce contention.
-    fn write_blob(
-        &self,
-        bytes: &[u8],
-        object_type: &'static str,
-    ) -> BackendResult<gix::hash::ObjectId> {
-        let oid = gix::objs::compute_hash(
-            self.base_repo.objects.object_hash(),
-            gix::objs::Kind::Blob,
-            bytes,
-        )
-        .map_err(|err| BackendError::WriteObject {
-            object_type,
-            source: err.into(),
-        })?;
-
-        let locked_repo = self.lock_git_repo();
-        if !locked_repo.objects.exists(&oid) {
-            // reuse the precomputed hash, since Gitoxide provides an API for it (otherwise
-            // Gitoxide recomputes it).
-            let write_oid = locked_repo
-                .objects
-                .write_buf_with_known_id(gix::objs::Kind::Blob, bytes, oid)
-                .map_err(|err| BackendError::WriteObject {
-                    object_type,
-                    source: err.into(),
-                })?;
-            assert!(oid == write_oid);
-        }
-        Ok(oid)
+    fn write_blob(&self, bytes: &[u8], object_type: &'static str) -> BackendResult<GritObjectId> {
+        write_object(&self.grit_repo, ObjectKind::Blob, bytes, object_type)
     }
 }
 
@@ -634,12 +596,238 @@ fn gix_open_opts_from_settings(settings: &UserSettings) -> gix::open::Options {
         .strict_config(true)
 }
 
+/// Opens the Git repository at `git_dir` with grit-lib.
+fn open_grit_repo(git_dir: &Path) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+    let options = grit_lib::prelude::RepositoryOptions::with_environment(
+        grit_lib::prelude::Environment::capture_process(),
+    );
+    grit_lib::repo::Repository::open(git_dir, &options)
+}
+
+/// Reads the shallow roots recorded in `$GIT_DIR/shallow`.
+fn read_shallow_root_ids(common_dir: &Path) -> BackendResult<Vec<CommitId>> {
+    let path = common_dir.join("shallow");
+    let content = match fs::read(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(err) => return Err(BackendError::Other(err.into())),
+    };
+    content
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|hex| {
+            CommitId::try_from_hex(hex).ok_or_else(|| {
+                let line = String::from_utf8_lossy(hex);
+                BackendError::Other(format!("Invalid shallow entry: {line}").into())
+            })
+        })
+        .collect()
+}
+
+/// Returns the empty tree id for the given hash algorithm.
+fn empty_tree_oid(hash_algo: HashAlgo) -> GritObjectId {
+    grit_lib::objects::hash::hash_object(hash_algo, ObjectKind::Tree, b"").unwrap()
+}
+
+fn read_object_of_kind(
+    repo: &grit_lib::repo::Repository,
+    id: &impl ObjectId,
+    kind: ObjectKind,
+) -> BackendResult<Vec<u8>> {
+    let oid = validate_git_object_id(repo, id)?;
+    let object = repo.odb().read(&oid).map_err(|err| match err {
+        grit_lib::error::Error::ObjectNotFound(_) => not_found_err(id),
+        err => to_read_object_err(err, id),
+    })?;
+    if object.kind != kind {
+        return Err(to_read_object_err(
+            format!("expected {kind} object, found {}", object.kind),
+            id,
+        ));
+    }
+    Ok(object.data)
+}
+
+fn write_object(
+    repo: &grit_lib::repo::Repository,
+    kind: ObjectKind,
+    data: &[u8],
+    object_type: &'static str,
+) -> BackendResult<GritObjectId> {
+    repo.odb()
+        .write(kind, data)
+        .map_err(|err| BackendError::WriteObject {
+            object_type,
+            source: Box::new(err),
+        })
+}
+
+/// Commit object fields, borrowed from the raw object data.
+///
+/// The decoding of header values follows Git: continuation lines of a
+/// multi-line header lose their leading space.
+struct ParsedCommit<'a> {
+    data: &'a [u8],
+    tree: GritObjectId,
+    parents: Vec<GritObjectId>,
+    author: &'a [u8],
+    committer: &'a [u8],
+    /// Name, decoded value, and byte range of the whole header in `data`.
+    extra_headers: Vec<(&'a [u8], Cow<'a, [u8]>, Range<usize>)>,
+    message: &'a [u8],
+}
+
+impl<'a> ParsedCommit<'a> {
+    fn parse(data: &'a [u8]) -> Result<Self, String> {
+        let mut tree = None;
+        let mut parents = Vec::new();
+        let mut author = None;
+        let mut committer = None;
+        let mut extra_headers = Vec::new();
+        let mut pos = 0;
+        loop {
+            if pos >= data.len() {
+                return Err("missing blank line before message".to_owned());
+            }
+            if data[pos] == b'\n' {
+                pos += 1;
+                break;
+            }
+            let start = pos;
+            let line_end = find_line_end(data, pos);
+            let line = &data[start..line_end];
+            let (name, first_value) = match line.iter().position(|b| *b == b' ') {
+                Some(i) => (&line[..i], &line[i + 1..]),
+                None => (line, &b""[..]),
+            };
+            pos = (line_end + 1).min(data.len());
+            let mut continuation_lines = Vec::new();
+            while data.get(pos) == Some(&b' ') {
+                let end = find_line_end(data, pos);
+                continuation_lines.push(&data[pos + 1..end]);
+                pos = (end + 1).min(data.len());
+            }
+            match name {
+                b"tree" if tree.is_none() => tree = Some(parse_header_oid(first_value)?),
+                b"parent" if author.is_none() => parents.push(parse_header_oid(first_value)?),
+                b"author" if author.is_none() => author = Some(first_value),
+                b"committer" if committer.is_none() => committer = Some(first_value),
+                _ => {
+                    let value = if continuation_lines.is_empty() {
+                        Cow::Borrowed(first_value)
+                    } else {
+                        let mut value = first_value.to_vec();
+                        for line in continuation_lines {
+                            value.push(b'\n');
+                            value.extend_from_slice(line);
+                        }
+                        value.push(b'\n');
+                        Cow::Owned(value)
+                    };
+                    extra_headers.push((name, value, start..pos));
+                }
+            }
+        }
+        Ok(Self {
+            data,
+            tree: tree.ok_or("missing tree header")?,
+            parents,
+            author: author.ok_or("missing author header")?,
+            committer: committer.ok_or("missing committer header")?,
+            extra_headers,
+            message: &data[pos..],
+        })
+    }
+
+    fn find_extra_header(&self, name: &str) -> Option<&[u8]> {
+        self.extra_headers
+            .iter()
+            .find(|(key, _, _)| *key == name.as_bytes())
+            .map(|(_, value, _)| value.as_ref())
+    }
+
+    /// Returns the signature and the signed data (the commit without the
+    /// signature header).
+    fn signature(&self, field_name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (_, sig, range) = self
+            .extra_headers
+            .iter()
+            .find(|(key, _, _)| *key == field_name.as_bytes())?;
+        let mut signed_data = self.data[..range.start].to_vec();
+        signed_data.extend_from_slice(&self.data[range.end..]);
+        Some((sig.to_vec(), signed_data))
+    }
+}
+
+fn find_line_end(data: &[u8], start: usize) -> usize {
+    data[start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(data.len(), |i| start + i)
+}
+
+fn parse_header_oid(hex: &[u8]) -> Result<GritObjectId, String> {
+    str::from_utf8(hex)
+        .ok()
+        .and_then(|hex| GritObjectId::from_hex(hex).ok())
+        .ok_or_else(|| format!("invalid object id: {}", String::from_utf8_lossy(hex)))
+}
+
+/// Field name of the commit signature header for the given hash algorithm.
+fn signature_field_name(hash_algo: HashAlgo) -> &'static str {
+    match hash_algo {
+        HashAlgo::Sha1 => "gpgsig",
+        _ => "gpgsig-sha256",
+    }
+}
+
+/// Serializes commit headers and message in Git's canonical order.
+fn serialize_git_commit(
+    tree: &GritObjectId,
+    parents: &[GritObjectId],
+    author: &[u8],
+    committer: &[u8],
+    extra_headers: &[(String, Vec<u8>)],
+    message: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(512);
+    out.extend_from_slice(b"tree ");
+    out.extend_from_slice(tree.to_hex().as_bytes());
+    out.push(b'\n');
+    for parent in parents {
+        out.extend_from_slice(b"parent ");
+        out.extend_from_slice(parent.to_hex().as_bytes());
+        out.push(b'\n');
+    }
+    for (name, value) in [("author", author), ("committer", committer)] {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(value);
+        out.push(b'\n');
+    }
+    for (name, value) in extra_headers {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
+        let mut lines = value.split_inclusive(|b| *b == b'\n');
+        if let Some(line) = lines.next() {
+            out.extend_from_slice(line);
+        }
+        for line in lines {
+            out.push(b' ');
+            out.extend_from_slice(line);
+        }
+        if !value.ends_with(b"\n") {
+            out.push(b'\n');
+        }
+    }
+    out.push(b'\n');
+    out.extend_from_slice(message);
+    out
+}
+
 /// Parses the `jj:conflict-labels` header value if present.
-fn extract_conflict_labels_from_commit(commit: &gix::objs::CommitRef) -> Merge<String> {
-    let Some(value) = commit
-        .extra_headers()
-        .find(JJ_CONFLICT_LABELS_COMMIT_HEADER)
-    else {
+fn extract_conflict_labels_from_commit(commit: &ParsedCommit) -> Merge<String> {
+    let Some(value) = commit.find_extra_header(JJ_CONFLICT_LABELS_COMMIT_HEADER) else {
         return Merge::resolved(String::new());
     };
 
@@ -653,13 +841,13 @@ fn extract_conflict_labels_from_commit(commit: &gix::objs::CommitRef) -> Merge<S
 
 /// Parses the `jj:trees` header value if present, otherwise returns the
 /// resolved tree ID from Git.
-fn extract_root_tree_from_commit(commit: &gix::objs::CommitRef) -> Result<Merge<TreeId>, ()> {
-    let Some(value) = commit.extra_headers().find(JJ_TREES_COMMIT_HEADER) else {
-        let tree_id = TreeId::from_bytes(commit.tree().as_bytes());
+fn extract_root_tree_from_commit(commit: &ParsedCommit) -> Result<Merge<TreeId>, ()> {
+    let Some(value) = commit.find_extra_header(JJ_TREES_COMMIT_HEADER) else {
+        let tree_id = TreeId::from_bytes(commit.tree.as_bytes());
         return Ok(Merge::resolved(tree_id));
     };
 
-    let hash_len = commit.tree().kind().len_in_bytes();
+    let hash_len = commit.tree.as_bytes().len();
     let mut tree_ids = SmallVec::new();
     for hex in value.split(|b| *b == b' ') {
         let tree_id = TreeId::try_from_hex(hex).ok_or(())?;
@@ -679,13 +867,11 @@ fn extract_root_tree_from_commit(commit: &gix::objs::CommitRef) -> Result<Merge<
 
 fn commit_from_git_without_root_parent(
     id: &CommitId,
-    git_object: &gix::Object,
+    data: &[u8],
+    hash_algo: HashAlgo,
     is_shallow: bool,
 ) -> BackendResult<Commit> {
-    let decode_err = |err: gix::Error| to_read_object_err(err, id);
-    let commit = git_object
-        .try_to_commit_ref()
-        .map_err(|err| to_read_object_err(err, id))?;
+    let commit = ParsedCommit::parse(data).map_err(|err| to_read_object_err(err, id))?;
 
     // If the git header has a change-id field, we attempt to convert that to a
     // valid JJ Change Id
@@ -699,7 +885,8 @@ fn commit_from_git_without_root_parent(
         vec![]
     } else {
         commit
-            .parents()
+            .parents
+            .iter()
             .map(|oid| CommitId::from_bytes(oid.as_bytes()))
             .collect_vec()
     };
@@ -716,27 +903,15 @@ fn commit_from_git_without_root_parent(
     // nothing.
     // TODO: what should we do with commit.encoding?
     let description = String::from_utf8_lossy(commit.message).into_owned();
-    let author = signature_from_git(commit.author().map_err(decode_err)?);
-    let committer = signature_from_git(commit.committer().map_err(decode_err)?);
+    let decode_err = |err: String| to_read_object_err(err, id);
+    let author = signature_from_git(commit.author).map_err(decode_err)?;
+    let committer = signature_from_git(commit.committer).map_err(decode_err)?;
 
     // If the commit is signed, extract both the signature and the signed data
     // (which is the commit buffer with the gpgsig header omitted).
-    // We have to re-parse the raw commit data because gix CommitRef does not give
-    // us the sogned data, only the signature.
-    // Ideally, we could use try_to_commit_ref_iter at the beginning of this
-    // function and extract everything from that. For now, this works
     let secure_sig = commit
-        .extra_headers
-        .iter()
-        .any(|(k, _)| *k == signature_field_name(git_object.id.kind()))
-        .then(|| CommitRefIter::signature(&git_object.data, git_object.id.kind()))
-        .transpose()
-        .map_err(decode_err)?
-        .flatten()
-        .map(|(sig, data)| SecureSig {
-            data: data.to_bstring().into(),
-            sig: sig.into_owned().into(),
-        });
+        .signature(signature_field_name(hash_algo))
+        .map(|(sig, data)| SecureSig { data, sig });
 
     Ok(Commit {
         parents,
@@ -753,10 +928,9 @@ fn commit_from_git_without_root_parent(
 }
 
 /// Extracts change id from commit headers.
-pub fn extract_change_id_from_commit(commit: &gix::objs::CommitRef) -> Option<ChangeId> {
+fn extract_change_id_from_commit(commit: &ParsedCommit) -> Option<ChangeId> {
     commit
-        .extra_headers()
-        .find(CHANGE_ID_COMMIT_HEADER)
+        .find_extra_header(CHANGE_ID_COMMIT_HEADER)
         .and_then(ChangeId::try_from_reverse_hex)
         .filter(|val| val.as_bytes().len() == CHANGE_ID_LENGTH)
 }
@@ -782,33 +956,75 @@ pub fn synthetic_change_id_from_git_commit_id(id: &CommitId) -> ChangeId {
 
 const EMPTY_STRING_PLACEHOLDER: &str = "JJ_EMPTY_STRING";
 
-fn signature_from_git(signature: gix::actor::SignatureRef) -> Signature {
-    let name = signature.name;
-    let name = if name != EMPTY_STRING_PLACEHOLDER {
-        String::from_utf8_lossy(name).into_owned()
-    } else {
-        "".to_string()
+/// Parses a `name <email> seconds offset` signature line.
+fn signature_from_git(raw: &[u8]) -> Result<Signature, String> {
+    let line = &raw[..find_line_end(raw, 0)];
+    let right_delim = line
+        .iter()
+        .rposition(|b| *b == b'>')
+        .ok_or("Closing '>' not found")?;
+    let name_and_email = &line[..right_delim];
+    let skip_from_right = name_and_email
+        .iter()
+        .rev()
+        .take_while(|b| **b == b'>')
+        .count();
+    let left_delim = name_and_email
+        .iter()
+        .position(|b| *b == b'<')
+        .ok_or("Opening '<' not found")?;
+    let skip_from_left = line[left_delim..]
+        .iter()
+        .take_while(|b| **b == b'<')
+        .count();
+    let name = &line[..left_delim];
+    let name = name.strip_suffix(b" ").unwrap_or(name);
+    let email = line
+        .get(left_delim + skip_from_left..right_delim - skip_from_right)
+        .ok_or("Skipped parts run into each other")?;
+    let time = &line[right_delim + 1..];
+
+    let decode = |value: &[u8]| {
+        if value != EMPTY_STRING_PLACEHOLDER.as_bytes() {
+            String::from_utf8_lossy(value).into_owned()
+        } else {
+            "".to_string()
+        }
     };
-    let email = signature.email;
-    let email = if email != EMPTY_STRING_PLACEHOLDER {
-        String::from_utf8_lossy(email).into_owned()
-    } else {
-        "".to_string()
-    };
-    let time = signature.time().unwrap_or_default();
-    let timestamp = MillisSinceEpoch(time.seconds * 1000);
-    let tz_offset = time.offset.div_euclid(60); // in minutes
-    Signature {
-        name,
-        email,
+    let (seconds, offset) = parse_git_time(time).unwrap_or_default();
+    Ok(Signature {
+        name: decode(name),
+        email: decode(email),
         timestamp: Timestamp {
-            timestamp,
-            tz_offset,
+            timestamp: MillisSinceEpoch(seconds * 1000),
+            tz_offset: offset.div_euclid(60), // in minutes
         },
-    }
+    })
 }
 
-fn signature_to_git(signature: &Signature) -> gix::actor::Signature {
+/// Parses `seconds +hhmm` into seconds since epoch and offset in seconds.
+fn parse_git_time(time: &[u8]) -> Option<(i64, i32)> {
+    let time = str::from_utf8(time).ok()?;
+    let mut parts = time.split_ascii_whitespace();
+    let seconds = parts.next()?.parse().ok()?;
+    let offset = parts.next().unwrap_or("+0000");
+    let (sign, digits) = match offset.as_bytes().first()? {
+        b'+' => (1, &offset[1..]),
+        b'-' => (-1, &offset[1..]),
+        _ => return None,
+    };
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = digits[..2].parse().ok()?;
+    let minutes: i32 = digits[2..].parse().ok()?;
+    Some((seconds, sign * (hours * 3600 + minutes * 60)))
+}
+
+/// Formats a signature as `name <email> seconds offset`.
+///
+/// `seconds` overrides the signature's timestamp (in seconds since epoch).
+fn signature_to_git(signature: &Signature, seconds: i64) -> Result<Vec<u8>, String> {
     // git does not support empty names or emails
     let name = if !signature.name.is_empty() {
         &signature.name
@@ -820,15 +1036,20 @@ fn signature_to_git(signature: &Signature) -> gix::actor::Signature {
     } else {
         EMPTY_STRING_PLACEHOLDER
     };
-    let time = gix::date::Time::new(
-        signature.timestamp.timestamp.0.div_euclid(1000),
-        signature.timestamp.tz_offset * 60, // in seconds
-    );
-    gix::actor::Signature {
-        name: name.into(),
-        email: email.into(),
-        time,
+    if [name, email]
+        .iter()
+        .any(|token| token.contains(['<', '>', '\n']))
+    {
+        return Err("Signature name or email must not contain '<', '>' or \\n".to_owned());
     }
+    let offset = signature.timestamp.tz_offset * 60; // in seconds
+    let hours = offset.unsigned_abs() / 3600;
+    let minutes = (offset.unsigned_abs() % 3600) / 60;
+    if hours > 99 {
+        return Err("Cannot represent offsets larger than +-9900".to_owned());
+    }
+    let sign = if offset < 0 { '-' } else { '+' };
+    Ok(format!("{name} <{email}> {seconds} {sign}{hours:02}{minutes:02}").into_bytes())
 }
 
 fn serialize_extras(commit: &Commit) -> Vec<u8> {
@@ -994,6 +1215,22 @@ fn run_git_gc(program: &OsStr, git_dir: &Path, keep_newer: SystemTime) -> Result
 }
 
 fn validate_git_object_id(
+    repo: &grit_lib::repo::Repository,
+    id: &impl ObjectId,
+) -> BackendResult<GritObjectId> {
+    let expected_algo = repo.odb().hash_algo();
+    match GritObjectId::from_bytes(id.as_bytes()) {
+        Ok(oid) if oid.algo() == expected_algo => Ok(oid),
+        _ => Err(BackendError::InvalidHashLength {
+            expected: expected_algo.len(),
+            actual: id.as_bytes().len(),
+            object_type: id.object_type(),
+            hash: id.hex(),
+        }),
+    }
+}
+
+fn validate_gix_object_id(
     repo: &gix::Repository,
     id: &impl ObjectId,
 ) -> BackendResult<gix::ObjectId> {
@@ -1037,7 +1274,7 @@ fn to_invalid_utf8_err(source: Utf8Error, id: &impl ObjectId) -> BackendError {
 }
 
 fn import_extra_metadata_entries_from_heads(
-    git_repo: &gix::Repository,
+    git_repo: &grit_lib::repo::Repository,
     mut_table: &mut MutableTable,
     _table_lock: &FileLock,
     head_ids: &HashSet<&CommitId>,
@@ -1048,16 +1285,14 @@ fn import_extra_metadata_entries_from_heads(
         .filter(|&id| mut_table.get_value(id.as_bytes()).is_none())
         .map(|&id| id.clone())
         .collect_vec();
+    let hash_algo = git_repo.odb().hash_algo();
     while let Some(id) = work_ids.pop() {
-        let git_object = git_repo
-            .try_find_object(validate_git_object_id(git_repo, &id)?)
-            .map_err(|err| to_read_object_err(err, &id))?
-            .ok_or_else(|| not_found_err(&id))?;
+        let data = read_object_of_kind(git_repo, &id, ObjectKind::Commit)?;
         let is_shallow = shallow_roots.contains(&id);
         // TODO(#1624): Should we read the root tree here and check if it has a
         // `.jjconflict-...` entries? That could happen if the user used `git` to e.g.
         // change the description of a commit with tree-level conflicts.
-        let commit = commit_from_git_without_root_parent(&id, &git_object, is_shallow)?;
+        let commit = commit_from_git_without_root_parent(&id, &data, hash_algo, is_shallow)?;
         mut_table.add_entry(id.to_bytes(), serialize_extras(&commit));
         work_ids.extend(
             commit
@@ -1084,7 +1319,7 @@ impl Backend for GitBackend {
     }
 
     fn commit_id_length(&self) -> usize {
-        self.base_repo.objects.object_hash().len_in_bytes()
+        self.grit_repo.odb().hash_algo().len()
     }
 
     fn change_id_length(&self) -> usize {
@@ -1129,16 +1364,9 @@ impl Backend for GitBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
-        let locked_repo = self.lock_git_repo();
-        let git_blob_id = validate_git_object_id(&locked_repo, id)?;
-        let mut blob = locked_repo
-            .try_find_object(git_blob_id)
-            .map_err(|err| to_read_object_err(err, id))?
-            .ok_or_else(|| not_found_err(id))?
-            .try_into_blob()
-            .map_err(|err| to_read_object_err(err, id))?;
-        let target = String::from_utf8(blob.take_data())
-            .map_err(|err| to_invalid_utf8_err(err.utf8_error(), id))?;
+        let data = read_object_of_kind(&self.grit_repo, id, ObjectKind::Blob)?;
+        let target =
+            String::from_utf8(data).map_err(|err| to_invalid_utf8_err(err.utf8_error(), id))?;
         Ok(target)
     }
 
@@ -1170,49 +1398,42 @@ impl Backend for GitBackend {
             return Ok(Tree::default());
         }
 
-        let locked_repo = self.lock_git_repo();
-        let git_tree_id = validate_git_object_id(&locked_repo, id)?;
-        let git_tree = locked_repo
-            .try_find_object(git_tree_id)
-            .map_err(|err| to_read_object_err(err, id))?
-            .ok_or_else(|| not_found_err(id))?
-            .try_into_tree()
-            .map_err(|err| to_read_object_err(err, id))?;
-        let mut entries: Vec<_> = git_tree
-            .iter()
+        let data = read_object_of_kind(&self.grit_repo, id, ObjectKind::Tree)?;
+        let oid_len = self.grit_repo.odb().hash_algo().len();
+        let mut entries: Vec<_> = TreeRefIter::with_oid_len(&data, oid_len)
             .map(|entry| -> BackendResult<_> {
                 let entry = entry.map_err(|err| to_read_object_err(err, id))?;
                 let name = RepoPathComponentBuf::new(
-                    str::from_utf8(entry.filename()).map_err(|err| to_invalid_utf8_err(err, id))?,
+                    str::from_utf8(entry.name).map_err(|err| to_invalid_utf8_err(err, id))?,
                 )
                 .map_err(|err| to_read_object_err(err, id))?;
-                let value = match entry.mode().kind() {
-                    gix::object::tree::EntryKind::Tree => {
-                        let id = TreeId::from_bytes(entry.oid().as_bytes());
+                let value = match TreeEntryKind::from_mode(entry.mode) {
+                    TreeEntryKind::Tree => {
+                        let id = TreeId::from_bytes(entry.oid.as_bytes());
                         TreeValue::Tree(id)
                     }
-                    gix::object::tree::EntryKind::Blob => {
-                        let id = FileId::from_bytes(entry.oid().as_bytes());
+                    TreeEntryKind::Blob => {
+                        let id = FileId::from_bytes(entry.oid.as_bytes());
                         TreeValue::File {
                             id,
                             executable: false,
                             copy_id: CopyId::placeholder(),
                         }
                     }
-                    gix::object::tree::EntryKind::BlobExecutable => {
-                        let id = FileId::from_bytes(entry.oid().as_bytes());
+                    TreeEntryKind::BlobExecutable => {
+                        let id = FileId::from_bytes(entry.oid.as_bytes());
                         TreeValue::File {
                             id,
                             executable: true,
                             copy_id: CopyId::placeholder(),
                         }
                     }
-                    gix::object::tree::EntryKind::Link => {
-                        let id = SymlinkId::from_bytes(entry.oid().as_bytes());
+                    TreeEntryKind::Link => {
+                        let id = SymlinkId::from_bytes(entry.oid.as_bytes());
                         TreeValue::Symlink(id)
                     }
-                    gix::object::tree::EntryKind::Commit => {
-                        let id = CommitId::from_bytes(entry.oid().as_bytes());
+                    TreeEntryKind::Commit => {
+                        let id = CommitId::from_bytes(entry.oid.as_bytes());
                         TreeValue::GitSubmodule(id)
                     }
                 };
@@ -1228,57 +1449,33 @@ impl Backend for GitBackend {
     }
 
     async fn write_tree(&self, _path: &RepoPath, contents: &Tree) -> BackendResult<TreeId> {
-        // Tree entries to be written must be sorted by Entry::filename(), which
-        // is slightly different from the order of our backend::Tree.
         let entries = contents
             .entries()
             .map(|entry| {
-                let filename = BString::from(entry.name().as_internal_str());
-                match entry.value() {
+                let name = entry.name().as_internal_str().as_bytes().to_vec();
+                let (kind, id) = match entry.value() {
                     TreeValue::File {
                         id,
                         executable: false,
                         copy_id: _, // TODO: Use the value
-                    } => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Blob.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
-                    },
+                    } => (TreeEntryKind::Blob, id.as_bytes()),
                     TreeValue::File {
                         id,
                         executable: true,
                         copy_id: _, // TODO: Use the value
-                    } => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::BlobExecutable.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
-                    },
-                    TreeValue::Symlink(id) => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Link.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
-                    },
-                    TreeValue::Tree(id) => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Tree.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
-                    },
-                    TreeValue::GitSubmodule(id) => gix::objs::tree::Entry {
-                        mode: gix::object::tree::EntryKind::Commit.into(),
-                        filename,
-                        oid: gix::ObjectId::from_bytes_or_panic(id.as_bytes()),
-                    },
+                    } => (TreeEntryKind::BlobExecutable, id.as_bytes()),
+                    TreeValue::Symlink(id) => (TreeEntryKind::Link, id.as_bytes()),
+                    TreeValue::Tree(id) => (TreeEntryKind::Tree, id.as_bytes()),
+                    TreeValue::GitSubmodule(id) => (TreeEntryKind::Commit, id.as_bytes()),
+                };
+                GritTreeEntry {
+                    mode: kind.mode(),
+                    name,
+                    oid: GritObjectId::from_bytes(id).unwrap(),
                 }
             })
-            .sorted_unstable()
-            .collect();
-        let locked_repo = self.lock_git_repo();
-        let oid = locked_repo
-            .write_object(gix::objs::Tree { entries })
-            .map_err(|err| BackendError::WriteObject {
-                object_type: "tree",
-                source: Box::new(err),
-            })?;
+            .collect_vec();
+        let oid = write_tree_entries(&self.grit_repo, entries)?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
     }
 
@@ -1292,14 +1489,10 @@ impl Backend for GitBackend {
         }
 
         let mut commit = {
-            let locked_repo = self.lock_git_repo();
-            let git_commit_id = validate_git_object_id(&locked_repo, id)?;
-            let git_object = locked_repo
-                .try_find_object(git_commit_id)
-                .map_err(|err| to_read_object_err(err, id))?
-                .ok_or_else(|| not_found_err(id))?;
-            let is_shallow = self.shallow_root_ids(&locked_repo)?.contains(id);
-            commit_from_git_without_root_parent(id, &git_object, is_shallow)?
+            let data = read_object_of_kind(&self.grit_repo, id, ObjectKind::Commit)?;
+            let is_shallow = self.shallow_root_ids()?.contains(id);
+            let hash_algo = self.grit_repo.odb().hash_algo();
+            commit_from_git_without_root_parent(id, &data, hash_algo, is_shallow)?
         };
         if commit.parents.is_empty() {
             commit.parents.push(self.root_commit_id.clone());
@@ -1329,14 +1522,21 @@ impl Backend for GitBackend {
     ) -> BackendResult<(CommitId, Commit)> {
         assert!(contents.secure_sig.is_none(), "commit.secure_sig was set");
 
-        let locked_repo = self.lock_git_repo();
+        let repo = &self.grit_repo;
+        let hash_algo = repo.odb().hash_algo();
         let tree_ids = &contents.root_tree;
         let git_tree_id = match tree_ids.as_resolved() {
-            Some(tree_id) => validate_git_object_id(&locked_repo, tree_id)?,
-            None => write_tree_conflict(&locked_repo, tree_ids)?,
+            Some(tree_id) => validate_git_object_id(repo, tree_id)?,
+            None => write_tree_conflict(repo, tree_ids)?,
         };
-        let author = signature_to_git(&contents.author);
-        let mut committer = signature_to_git(&contents.committer);
+        let to_signature_err = |err: String| BackendError::WriteObject {
+            object_type: "commit",
+            source: err.into(),
+        };
+        let author_seconds = contents.author.timestamp.timestamp.0.div_euclid(1000);
+        let author =
+            signature_to_git(&contents.author, author_seconds).map_err(to_signature_err)?;
+        let mut committer_seconds = contents.committer.timestamp.timestamp.0.div_euclid(1000);
         let message = &contents.description;
         if contents.parents.is_empty() {
             return Err(BackendError::Other(
@@ -1347,15 +1547,15 @@ impl Backend for GitBackend {
         // commit. Since the root commit is an ancestor of every commit, we also leave
         // it out of the parents of a merge commit.
         contents.parents.retain(|id| *id != self.root_commit_id);
-        let mut parents = SmallVec::new();
+        let mut parents = Vec::new();
         for parent_id in &contents.parents {
-            parents.push(validate_git_object_id(&locked_repo, parent_id)?);
+            parents.push(validate_git_object_id(repo, parent_id)?);
         }
         // Match what read_commit() returns for a Git commit without parents.
         if contents.parents.is_empty() {
             contents.parents.push(self.root_commit_id.clone());
         }
-        let mut extra_headers: Vec<(BString, BString)> = vec![];
+        let mut extra_headers: Vec<(String, Vec<u8>)> = vec![];
         if !contents.conflict_labels.is_resolved() {
             // Labels cannot contain '\n' since we use it as a separator in the header.
             assert!(
@@ -1383,15 +1583,8 @@ impl Backend for GitBackend {
         }
 
         if tree_ids.iter().any(|id| id == &self.empty_tree_id) {
-            let tree = gix::objs::Tree::empty();
-            let tree_id =
-                locked_repo
-                    .write_object(&tree)
-                    .map_err(|err| BackendError::WriteObject {
-                        object_type: "tree",
-                        source: Box::new(err),
-                    })?;
-            assert!(tree_id.is_empty_tree());
+            let tree_id = write_object(repo, ObjectKind::Tree, b"", "tree")?;
+            assert!(TreeId::from_bytes(tree_id.as_bytes()) == self.empty_tree_id);
         }
 
         let extras = serialize_extras(&contents);
@@ -1404,39 +1597,35 @@ impl Backend for GitBackend {
         // repository is rsync-ed.
         let (table, table_lock) = self.read_extra_metadata_table_locked()?;
         let id = loop {
-            let mut commit = gix::objs::Commit {
-                message: message.to_owned().into(),
-                tree: git_tree_id,
-                author: author.clone(),
-                committer: committer.clone(),
-                encoding: None,
-                parents: parents.clone(),
-                extra_headers: extra_headers.clone(),
-            };
-
+            let committer = signature_to_git(&contents.committer, committer_seconds)
+                .map_err(to_signature_err)?;
+            let mut headers = extra_headers.clone();
             if let Some(sign) = &mut sign_with {
-                // we don't use gix pool, but at least use their heuristic
-                let mut data = Vec::with_capacity(512);
-                commit.write_to(&mut data).unwrap();
-
+                let data = serialize_git_commit(
+                    &git_tree_id,
+                    &parents,
+                    &author,
+                    &committer,
+                    &headers,
+                    message.as_bytes(),
+                );
                 let sig = sign(&data).map_err(|err| BackendError::WriteObject {
                     object_type: "commit",
                     source: Box::new(err),
                 })?;
-                let field = signature_field_name(git_tree_id.kind());
-                commit
-                    .extra_headers
-                    .push((field.into(), sig.clone().into()));
+                headers.push((signature_field_name(hash_algo).into(), sig.clone()));
                 contents.secure_sig = Some(SecureSig { data, sig });
             }
 
-            let git_id =
-                locked_repo
-                    .write_object(&commit)
-                    .map_err(|err| BackendError::WriteObject {
-                        object_type: "commit",
-                        source: Box::new(err),
-                    })?;
+            let data = serialize_git_commit(
+                &git_tree_id,
+                &parents,
+                &author,
+                &committer,
+                &headers,
+                message.as_bytes(),
+            );
+            let git_id = write_object(repo, ObjectKind::Commit, &data, "commit")?;
 
             match table.get_value(git_id.as_bytes()) {
                 Some(existing_extras) if existing_extras != extras => {
@@ -1453,7 +1642,7 @@ impl Backend for GitBackend {
                     // commit had its timestamp set to 0. Moreover, we test that
                     // a commit with a negative timestamp can still be written
                     // and read back by `jj`.
-                    committer.time.seconds -= 1;
+                    committer_seconds -= 1;
                 }
                 _ => break CommitId::from_bytes(git_id.as_bytes()),
             }
@@ -1461,13 +1650,13 @@ impl Backend for GitBackend {
 
         // Everything up to this point had no permanent effect on the repo except
         // GC-able objects
-        locked_repo
+        self.lock_git_repo()
             .edit_reference(to_no_gc_ref_update(&id))
             .map_err(|err| BackendError::Other(Box::new(err)))?;
 
         // Update the signature to match the one that was actually written to the object
         // store
-        contents.committer.timestamp.timestamp = MillisSinceEpoch(committer.time.seconds * 1000);
+        contents.committer.timestamp.timestamp = MillisSinceEpoch(committer_seconds * 1000);
         let mut mut_table = table.start_mutation();
         mut_table.add_entry(id.to_bytes(), extras);
         self.save_extra_metadata_table(mut_table, &table_lock)?;
@@ -1597,10 +1786,9 @@ impl Backend for GitBackend {
 /// present. The rest of the tree is copied from the first term of the conflict,
 /// which prevents editors with Git support from highlighting all files as new.
 fn write_tree_conflict(
-    repo: &gix::Repository,
+    repo: &grit_lib::repo::Repository,
     conflict: &Merge<TreeId>,
-) -> BackendResult<gix::ObjectId> {
-    // Tree entries to be written must be sorted by Entry::filename().
+) -> BackendResult<GritObjectId> {
     let mut entries = itertools::chain(
         conflict
             .removes()
@@ -1611,15 +1799,16 @@ fn write_tree_conflict(
             .enumerate()
             .map(|(i, tree_id)| (format!(".jjconflict-side-{i}"), tree_id)),
     )
-    .map(|(name, tree_id)| gix::objs::tree::Entry {
-        mode: gix::object::tree::EntryKind::Tree.into(),
-        filename: name.into(),
-        oid: gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
+    .map(|(name, tree_id)| GritTreeEntry {
+        mode: TreeEntryKind::Tree.mode(),
+        name: name.into_bytes(),
+        oid: GritObjectId::from_bytes(tree_id.as_bytes()).unwrap(),
     })
     .collect_vec();
-    let readme_id = repo
-        .write_blob(
-            r#"This commit was made by jj, https://jj-vcs.dev/.
+    let readme_id = write_object(
+        repo,
+        ObjectKind::Blob,
+        br#"This commit was made by jj, https://jj-vcs.dev/.
 The commit contains file conflicts, and therefore looks wrong when used with
 plain Git or other tools that are unfamiliar with jj.
 
@@ -1631,36 +1820,68 @@ If you see this file in your working copy, it probably means that you used a
 regular `git` command to check out a conflicted commit. Use `jj abandon` to
 recover.
 "#,
-        )
-        .map_err(|err| {
-            BackendError::Other(format!("Failed to write README for conflict tree: {err}").into())
-        })?
-        .detach();
-    entries.push(gix::objs::tree::Entry {
-        mode: gix::object::tree::EntryKind::Blob.into(),
-        filename: JJ_CONFLICT_README_FILE_NAME.into(),
+        "blob",
+    )?;
+    entries.push(GritTreeEntry {
+        mode: TreeEntryKind::Blob.mode(),
+        name: JJ_CONFLICT_README_FILE_NAME.into(),
         oid: readme_id,
     });
     let first_tree_id = conflict.first();
-    let first_tree = repo
-        .find_tree(gix::ObjectId::from_bytes_or_panic(first_tree_id.as_bytes()))
-        .map_err(|err| to_read_object_err(err, first_tree_id))?;
-    for entry in first_tree.iter() {
+    let first_tree = read_object_of_kind(repo, first_tree_id, ObjectKind::Tree)?;
+    let oid_len = repo.odb().hash_algo().len();
+    for entry in TreeRefIter::with_oid_len(&first_tree, oid_len) {
         let entry = entry.map_err(|err| to_read_object_err(err, first_tree_id))?;
-        if !entry.filename().starts_with(b".jjconflict")
-            && entry.filename() != JJ_CONFLICT_README_FILE_NAME
+        if !entry.name.starts_with(b".jjconflict")
+            && entry.name != JJ_CONFLICT_README_FILE_NAME.as_bytes()
         {
-            entries.push(entry.detach().into());
+            entries.push(entry.to_owned());
         }
     }
-    entries.sort_unstable();
-    let id = repo
-        .write_object(gix::objs::Tree { entries })
-        .map_err(|err| BackendError::WriteObject {
-            object_type: "tree",
-            source: Box::new(err),
-        })?;
-    Ok(id.detach())
+    write_tree_entries(repo, entries)
+}
+
+/// Kind of a Git tree entry, derived from its mode the way Git does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeEntryKind {
+    Tree,
+    Blob,
+    BlobExecutable,
+    Link,
+    Commit,
+}
+
+impl TreeEntryKind {
+    fn from_mode(mode: u32) -> Self {
+        match mode & 0o170000 {
+            0o040000 => Self::Tree,
+            0o120000 => Self::Link,
+            0o160000 => Self::Commit,
+            _ if mode & 0o111 != 0 => Self::BlobExecutable,
+            _ => Self::Blob,
+        }
+    }
+
+    fn mode(self) -> u32 {
+        match self {
+            Self::Tree => 0o040000,
+            Self::Blob => 0o100644,
+            Self::BlobExecutable => 0o100755,
+            Self::Link => 0o120000,
+            Self::Commit => 0o160000,
+        }
+    }
+}
+
+/// Writes a tree object, sorting the entries in Git's tree order.
+fn write_tree_entries(
+    repo: &grit_lib::repo::Repository,
+    mut entries: Vec<GritTreeEntry>,
+) -> BackendResult<GritObjectId> {
+    let is_tree = |entry: &GritTreeEntry| entry.mode == TreeEntryKind::Tree.mode();
+    entries.sort_unstable_by(|a, b| tree_entry_cmp(&a.name, is_tree(a), &b.name, is_tree(b)));
+    let data = serialize_tree(&entries);
+    write_object(repo, ObjectKind::Tree, &data, "tree")
 }
 
 #[cfg(test)]
@@ -1668,7 +1889,7 @@ mod tests {
     use std::assert_matches;
 
     use gix::date::parse::TimeBuf;
-    use gix::objs::CommitRef;
+    use gix::objs::WriteTo as _;
     use indoc::indoc;
     use test_case::test_case;
 
@@ -1994,7 +2215,7 @@ mod tests {
         commit.write_to(&mut commit_buf)?;
         let commit_str = str::from_utf8(&commit_buf)?;
 
-        let field = signature_field_name(object_hash);
+        let field = gix::objs::commit::signature_field_name(object_hash);
         commit.extra_headers.push((field.into(), secure_sig.into()));
 
         let git_commit_id = git_repo.write_object(&commit)?;
@@ -2016,9 +2237,7 @@ mod tests {
     #[test]
     fn change_id_parsing() {
         let id = |commit_object_bytes: &[u8]| {
-            extract_change_id_from_commit(
-                &CommitRef::from_bytes(commit_object_bytes, gix::hash::Kind::Sha1).unwrap(),
-            )
+            extract_change_id_from_commit(&ParsedCommit::parse(commit_object_bytes).unwrap())
         };
 
         let commit_with_id = indoc! {b"
@@ -2229,20 +2448,12 @@ mod tests {
 
     #[test]
     fn read_empty_string_placeholder() {
-        let git_signature1 = gix::actor::Signature {
-            name: EMPTY_STRING_PLACEHOLDER.into(),
-            email: "git.author@example.com".into(),
-            time: gix::date::Time::new(1000, 60 * 60),
-        };
-        let signature1 = signature_from_git(git_signature1.to_ref(&mut TimeBuf::default()));
+        let signature1 =
+            signature_from_git(b"JJ_EMPTY_STRING <git.author@example.com> 1000 +0100").unwrap();
         assert!(signature1.name.is_empty());
         assert_eq!(signature1.email, "git.author@example.com");
-        let git_signature2 = gix::actor::Signature {
-            name: "git committer".into(),
-            email: EMPTY_STRING_PLACEHOLDER.into(),
-            time: gix::date::Time::new(2000, -480 * 60),
-        };
-        let signature2 = signature_from_git(git_signature2.to_ref(&mut TimeBuf::default()));
+        let signature2 =
+            signature_from_git(b"git committer <JJ_EMPTY_STRING> 2000 -0800").unwrap();
         assert_eq!(signature2.name, "git committer");
         assert!(signature2.email.is_empty());
     }
@@ -2257,9 +2468,8 @@ mod tests {
                 tz_offset: 0,
             },
         };
-        let git_signature1 = signature_to_git(&signature1);
-        assert_eq!(git_signature1.name, EMPTY_STRING_PLACEHOLDER);
-        assert_eq!(git_signature1.email, "someone@example.com");
+        let git_signature1 = signature_to_git(&signature1, 0).unwrap();
+        assert_eq!(git_signature1, b"JJ_EMPTY_STRING <someone@example.com> 0 +0000");
         let signature2 = Signature {
             name: "Someone".to_string(),
             email: "".to_string(),
@@ -2268,9 +2478,8 @@ mod tests {
                 tz_offset: 0,
             },
         };
-        let git_signature2 = signature_to_git(&signature2);
-        assert_eq!(git_signature2.name, "Someone");
-        assert_eq!(git_signature2.email, EMPTY_STRING_PLACEHOLDER);
+        let git_signature2 = signature_to_git(&signature2, 0).unwrap();
+        assert_eq!(git_signature2, b"Someone <JJ_EMPTY_STRING> 0 +0000");
     }
 
     /// Test that parents get written correctly
@@ -2731,3 +2940,4 @@ mod tests {
         UserSettings::from_config_and_home_dir(config, None).unwrap()
     }
 }
+

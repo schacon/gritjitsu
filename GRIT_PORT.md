@@ -65,3 +65,9 @@ Phase B removes the `git` subprocesses.
 ## Progress log
 
 Each step is one commit on this fork, plus PRs to grit for library changes.
+
+- **Steps 1–3**: grit-lib is a dependency. `GitBackend` reads and writes blobs,
+  trees and commits through grit-lib. Commits are serialized byte-for-byte as
+  before, so commit ids don't change. `.gitignore` matching uses grit's new
+  `IgnorePatternList`. grit PRs: standalone ignore pattern list; strip only one
+  trailing CR from ignore lines. Tests: 3491/3491.
