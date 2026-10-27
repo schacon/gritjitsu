@@ -84,6 +84,22 @@ subprocess any more. The `git.executable-path` setting was removed.
 - **Progress:** remote "Counting/Compressing objects" progress is parsed from
   sideband lines. Local progress comes from grit's progress reporting.
 
+### Repository formats
+
+`grit-bench/formats.sh` runs the same steps against both builds:
+
+| | upstream jj | gritjitsu |
+| --- | --- | --- |
+| Colocated repo with **reftable** refs (`git init --ref-format=reftable`) | `jj git init` succeeds, but jj sees none of Git's refs and doesn't write bookmarks or `HEAD` back | works: refs import and export both ways, and the repo stays reftable |
+| Clone, fetch and push with a reftable remote | works (done by the `git` CLI) | works |
+| SHA-256 repo created by jj (`git.object-hash = "sha256"`) | works | works |
+| Clone, fetch and push between SHA-256 repos, with `git.object-hash = "sha256"` | works | works |
+| `jj git clone` of a SHA-256 remote without that setting | fails: `mismatched algorithms: client sha1; server sha256` | fails: grit switches the new repo to SHA-256 during the fetch, but jj already opened it as SHA-1 |
+
+Reftable support comes from grit-lib's ref store; jj only talks to it
+through the generic ref API. Neither build detects the remote's object
+format on clone yet.
+
 ## Changes to grit-lib
 
 The port needed fixes and additions to grit-lib. They live on the fork
@@ -240,6 +256,7 @@ BENCH_SMALL=~/src/ticgit BENCH_MEDIUM=~/src/jj BENCH_LARGE=~/src/git bash setup.
 bash run2.sh       # local benchmarks, two passes
 python3 summarize.py results
 bash net.sh        # network benchmarks
+bash formats.sh grit; bash formats.sh upstream   # reftable and SHA-256 checks
 ```
 
 ## License
