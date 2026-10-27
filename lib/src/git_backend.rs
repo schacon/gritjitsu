@@ -48,6 +48,13 @@ use grit_lib::objects::TreeEntry as GritTreeEntry;
 use grit_lib::objects::TreeRefIter;
 use grit_lib::objects::serialize_tree;
 use grit_lib::objects::tree_entry_cmp;
+use grit_lib::diff::DiffEntry;
+use grit_lib::diff::DiffStatus;
+use grit_lib::refs::store::Expected;
+use grit_lib::refs::store::RawRef;
+use grit_lib::refs::store::RefTransaction;
+use grit_lib::refs::store::RefUpdate;
+use grit_lib::refs::store::RefUpdateFlags;
 use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
@@ -487,10 +494,10 @@ impl GitBackend {
 
         // Create no-gc ref even if known to the extras table. Concurrent GC
         // process might have deleted the no-gc ref.
-        let locked_repo = self.lock_git_repo();
-        locked_repo
-            .edit_references(head_ids.iter().copied().map(to_no_gc_ref_update))
-            .map_err(|err| BackendError::Other(Box::new(err)))?;
+        edit_references(
+            &self.grit_repo,
+            head_ids.iter().copied().map(to_no_gc_ref_update),
+        )?;
 
         // These commits are imported from Git. Make our change ids persist (otherwise
         // future write_commit() could reassign new change id.)
@@ -514,48 +521,11 @@ impl GitBackend {
         read_object_of_kind(&self.grit_repo, id, ObjectKind::Blob)
     }
 
-    fn new_diff_platform(&self) -> BackendResult<gix::diff::blob::Platform> {
-        let attributes = gix::worktree::Stack::new(
-            Path::new(""),
-            gix::worktree::stack::State::AttributesStack(Default::default()),
-            gix::worktree::glob::pattern::Case::Sensitive,
-            Vec::new(),
-            Vec::new(),
-        );
-        let filter = gix::diff::blob::Pipeline::new(
-            Default::default(),
-            gix::filter::plumbing::Pipeline::new(
-                self.git_repo()
-                    .command_context()
-                    .map_err(|err| BackendError::Other(Box::new(err)))?,
-                self.git_repo().object_hash(),
-                Default::default(),
-            ),
-            Vec::new(),
-            Default::default(),
-        );
-        Ok(gix::diff::blob::Platform::new(
-            Default::default(),
-            filter,
-            gix::diff::blob::pipeline::Mode::ToGit,
-            attributes,
-        ))
-    }
-
-    fn read_tree_for_commit<'repo>(
-        &self,
-        repo: &'repo gix::Repository,
-        id: &CommitId,
-    ) -> BackendResult<gix::Tree<'repo>> {
+    fn read_tree_id_for_commit(&self, id: &CommitId) -> BackendResult<GritObjectId> {
         let tree = self.read_commit(id).block_on()?.root_tree;
         // TODO(kfm): probably want to do something here if it is a merge
         let tree_id = tree.first();
-        let gix_id = validate_gix_object_id(repo, tree_id)?;
-        repo.try_find_object(gix_id)
-            .map_err(|err| to_read_object_err(err, tree_id))?
-            .ok_or_else(|| not_found_err(tree_id))?
-            .try_into_tree()
-            .map_err(|err| to_read_object_err(err, tree_id))
+        validate_git_object_id(&self.grit_repo, tree_id)
     }
 
     fn write_blob(&self, bytes: &[u8], object_type: &'static str) -> BackendResult<GritObjectId> {
@@ -1085,64 +1055,77 @@ fn deserialize_extras(commit: &mut Commit, bytes: &[u8]) {
     }
 }
 
-/// Returns `RefEdit` that will create a ref in `refs/jj/keep` if not exist.
-/// Used for preventing GC of commits we create.
-fn to_no_gc_ref_update(id: &CommitId) -> gix::refs::transaction::RefEdit {
-    let name = format!("{NO_GC_REF_NAMESPACE}{id}");
-    let new = gix::refs::Target::Object(gix::ObjectId::from_bytes_or_panic(id.as_bytes()));
-    let expected = gix::refs::transaction::PreviousValue::ExistingMustMatch(new.clone());
-    gix::refs::transaction::RefEdit {
-        change: gix::refs::transaction::Change::Update {
-            log: gix::refs::transaction::LogChange {
-                message: "used by jj".into(),
-                ..Default::default()
-            },
-            expected,
-            new,
-        },
-        name: name.try_into().unwrap(),
-        deref: false,
+/// Returns `RefUpdate` that will create a ref in `refs/jj/keep`. Used for
+/// preventing GC of commits we create.
+fn to_no_gc_ref_update(id: &CommitId) -> RefUpdate {
+    let oid = GritObjectId::from_bytes(id.as_bytes()).unwrap();
+    RefUpdate {
+        name: format!("{NO_GC_REF_NAMESPACE}{id}"),
+        new_value: Some(RawRef::Direct(oid)),
+        // The ref name is derived from the id, so an existing ref already
+        // points to the same commit.
+        expected: Expected::Any,
+        reflog: None,
+        flags: RefUpdateFlags::default(),
     }
 }
 
-fn to_ref_deletion(git_ref: gix::refs::Reference) -> gix::refs::transaction::RefEdit {
-    let expected = gix::refs::transaction::PreviousValue::ExistingMustMatch(git_ref.target);
-    gix::refs::transaction::RefEdit {
-        change: gix::refs::transaction::Change::Delete {
-            expected,
-            log: gix::refs::transaction::RefLog::AndReference,
-        },
-        name: git_ref.name,
-        deref: false,
+fn to_ref_deletion(name: String, oid: GritObjectId) -> RefUpdate {
+    RefUpdate {
+        name,
+        new_value: None,
+        expected: Expected::Oid(oid),
+        reflog: None,
+        flags: RefUpdateFlags::default(),
     }
+}
+
+/// Applies the given ref updates in one transaction.
+fn edit_references(
+    repo: &grit_lib::repo::Repository,
+    updates: impl IntoIterator<Item = RefUpdate>,
+) -> BackendResult<()> {
+    let mut transaction = RefTransaction::new();
+    for update in updates {
+        transaction
+            .push_update(update)
+            .map_err(|err| BackendError::Other(err.into()))?;
+    }
+    if transaction.updates().is_empty() {
+        return Ok(());
+    }
+    repo.refs()
+        .prepare(transaction)
+        .and_then(|prepared| prepared.commit())
+        .map_err(|err| BackendError::Other(err.into()))
 }
 
 /// Recreates `refs/jj/keep` refs for the `new_heads`, and removes the other
 /// unreachable and non-head refs.
 fn recreate_no_gc_refs(
-    git_repo: &gix::Repository,
+    git_repo: &grit_lib::repo::Repository,
     new_heads: &HashSet<&CommitId>,
     keep_newer: SystemTime,
 ) -> BackendResult<()> {
     // Calculate diff between existing no-gc refs and new heads.
     let mut no_gc_refs_to_keep_count: usize = 0;
-    let mut no_gc_refs_to_delete: Vec<gix::refs::Reference> = Vec::new();
-    let git_references = git_repo
-        .references()
+    let mut no_gc_refs_to_delete: Vec<(String, GritObjectId)> = Vec::new();
+    let mut no_gc_refs = Vec::new();
+    git_repo
+        .refs()
+        .for_each_ref(NO_GC_REF_NAMESPACE, &mut |entry| {
+            no_gc_refs.push((entry.name.clone(), entry.value.clone()));
+            std::ops::ControlFlow::Continue(())
+        })
         .map_err(|err| BackendError::Other(err.into()))?;
-    let no_gc_refs_iter = git_references
-        .prefixed(NO_GC_REF_NAMESPACE)
-        .map_err(|err| BackendError::Other(err.into()))?;
-    for git_ref in no_gc_refs_iter {
-        let git_ref = git_ref
-            .map_err(|err| BackendError::Other(err.into()))?
-            .detach();
-        let oid = git_ref.target.try_id().ok_or_else(|| {
-            let name = git_ref.name.as_bstr();
-            BackendError::Other(format!("Symbolic no-gc ref found: {name}").into())
-        })?;
+    for (name, value) in no_gc_refs {
+        let RawRef::Direct(oid) = value else {
+            return Err(BackendError::Other(
+                format!("Symbolic no-gc ref found: {name}").into(),
+            ));
+        };
         let id = CommitId::from_bytes(oid.as_bytes());
-        let name_good = git_ref.name.as_bstr()[NO_GC_REF_NAMESPACE.len()..] == id.hex();
+        let name_good = name[NO_GC_REF_NAMESPACE.len()..] == id.hex();
         if new_heads.contains(&id) && name_good {
             no_gc_refs_to_keep_count += 1;
             continue;
@@ -1156,23 +1139,18 @@ fn recreate_no_gc_refs(
         // will always have a unique name. Doing that with the current
         // ref-per-head strategy would increase the number of the no-gc refs.
         // https://github.com/jj-vcs/jj/pull/2659#issuecomment-1837057782
-        let loose_ref_path = git_repo.path().join(
-            git_ref
-                .name
-                .to_path()
-                .map_err(|err| BackendError::Other(err.into()))?,
-        );
+        let loose_ref_path = git_repo.common_git_dir().join(&name);
         if let Ok(metadata) = loose_ref_path.metadata() {
             let mtime = metadata.modified().expect("unsupported platform?");
             if mtime > keep_newer {
-                tracing::trace!(?git_ref, "not deleting new");
+                tracing::trace!(?name, "not deleting new");
                 no_gc_refs_to_keep_count += 1;
                 continue;
             }
         }
         // Also deletes no-gc ref of random name created by old jj.
-        tracing::trace!(?git_ref, ?name_good, "will delete");
-        no_gc_refs_to_delete.push(git_ref);
+        tracing::trace!(?name, ?name_good, "will delete");
+        no_gc_refs_to_delete.push((name, oid));
     }
     tracing::info!(
         new_heads_count = new_heads.len(),
@@ -1183,14 +1161,12 @@ fn recreate_no_gc_refs(
 
     // It's slow to delete packed refs one by one, so update refs all at once.
     let ref_edits = itertools::chain(
-        no_gc_refs_to_delete.into_iter().map(to_ref_deletion),
+        no_gc_refs_to_delete
+            .into_iter()
+            .map(|(name, oid)| to_ref_deletion(name, oid)),
         new_heads.iter().copied().map(to_no_gc_ref_update),
     );
-    git_repo
-        .edit_references(ref_edits)
-        .map_err(|err| BackendError::Other(err.into()))?;
-
-    Ok(())
+    edit_references(git_repo, ref_edits)
 }
 
 fn run_git_gc(program: &OsStr, git_dir: &Path, keep_newer: SystemTime) -> Result<(), GitGcError> {
@@ -1223,22 +1199,6 @@ fn validate_git_object_id(
         Ok(oid) if oid.algo() == expected_algo => Ok(oid),
         _ => Err(BackendError::InvalidHashLength {
             expected: expected_algo.len(),
-            actual: id.as_bytes().len(),
-            object_type: id.object_type(),
-            hash: id.hex(),
-        }),
-    }
-}
-
-fn validate_gix_object_id(
-    repo: &gix::Repository,
-    id: &impl ObjectId,
-) -> BackendResult<gix::ObjectId> {
-    let expected_kind = repo.object_hash();
-    match gix::ObjectId::try_from(id.as_bytes()) {
-        Ok(id) if id.kind() == expected_kind => Ok(id),
-        _ => Err(BackendError::InvalidHashLength {
-            expected: expected_kind.len_in_bytes(),
             actual: id.as_bytes().len(),
             object_type: id.object_type(),
             hash: id.hex(),
@@ -1650,9 +1610,7 @@ impl Backend for GitBackend {
 
         // Everything up to this point had no permanent effect on the repo except
         // GC-able objects
-        self.lock_git_repo()
-            .edit_reference(to_no_gc_ref_update(&id))
-            .map_err(|err| BackendError::Other(Box::new(err)))?;
+        edit_references(&self.grit_repo, [to_no_gc_ref_update(&id)])?;
 
         // Update the signature to match the one that was actually written to the object
         // store
@@ -1669,78 +1627,65 @@ impl Backend for GitBackend {
         root_id: &CommitId,
         head_id: &CommitId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
-        let repo = self.git_repo();
-        let root_tree = self.read_tree_for_commit(&repo, root_id)?;
-        let head_tree = self.read_tree_for_commit(&repo, head_id)?;
+        let root_tree = self.read_tree_id_for_commit(root_id)?;
+        let head_tree = self.read_tree_id_for_commit(head_id)?;
 
-        let change_to_copy_record =
-            |change: gix::object::tree::diff::Change| -> BackendResult<Option<CopyRecord>> {
-                let gix::object::tree::diff::Change::Rewrite {
-                    source_location,
-                    source_entry_mode,
-                    source_id,
-                    entry_mode: dest_entry_mode,
-                    location: dest_location,
-                    ..
-                } = change
-                else {
-                    return Ok(None);
-                };
-                // TODO: Renamed symlinks cannot be returned because CopyRecord
-                // expects `source_file: FileId`.
-                if !source_entry_mode.is_blob() || !dest_entry_mode.is_blob() {
-                    return Ok(None);
-                }
-
-                let source = str::from_utf8(source_location)
-                    .map_err(|err| to_invalid_utf8_err(err, root_id))?;
-                let dest = str::from_utf8(dest_location)
-                    .map_err(|err| to_invalid_utf8_err(err, head_id))?;
-
-                let target = RepoPathBuf::from_internal_string(dest)
-                    .map_err(|err| to_read_object_err(err, head_id))?;
-                if !paths.is_none_or(|paths| paths.contains(&target)) {
-                    return Ok(None);
-                }
-
-                Ok(Some(CopyRecord {
-                    target,
-                    target_commit: head_id.clone(),
-                    source: RepoPathBuf::from_internal_string(source)
-                        .map_err(|err| to_read_object_err(err, root_id))?,
-                    source_file: FileId::from_bytes(source_id.as_bytes()),
-                    source_commit: root_id.clone(),
-                }))
+        let hash_algo = self.grit_repo.odb().hash_algo();
+        let empty_blob_id = grit_lib::objects::hash::hash_object(hash_algo, ObjectKind::Blob, b"")
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let change_to_copy_record = |change: DiffEntry| -> BackendResult<Option<CopyRecord>> {
+            if !matches!(change.status, DiffStatus::Renamed | DiffStatus::Copied) {
+                return Ok(None);
+            }
+            // TODO: Renamed symlinks cannot be returned because CopyRecord
+            // expects `source_file: FileId`.
+            let is_blob = |mode: &str| matches!(mode, "100644" | "100755");
+            if !is_blob(&change.old_mode) || !is_blob(&change.new_mode) {
+                return Ok(None);
+            }
+            // Empty files are too common to say anything about copies.
+            if change.old_oid == empty_blob_id {
+                return Ok(None);
+            }
+            let (Some(source), Some(dest)) = (change.old_path, change.new_path) else {
+                return Ok(None);
             };
 
-        let mut records: Vec<BackendResult<CopyRecord>> = Vec::new();
-        root_tree
-            .changes()
-            .map_err(|err| BackendError::Other(err.into()))?
-            .options(|opts| {
-                opts.track_path().track_rewrites(Some(gix::diff::Rewrites {
-                    copies: Some(gix::diff::rewrites::Copies {
-                        source: gix::diff::rewrites::CopySource::FromSetOfModifiedFiles,
-                        percentage: Some(0.5),
-                    }),
-                    percentage: Some(0.5),
-                    limit: 1000,
-                    track_empty: false,
-                }));
-            })
-            .for_each_to_obtain_tree_with_cache(
-                &head_tree,
-                &mut self.new_diff_platform()?,
-                |change| {
-                    match change_to_copy_record(change) {
-                        Ok(None) => {}
-                        Ok(Some(change)) => records.push(Ok(change)),
-                        Err(err) => records.push(Err(err)),
-                    }
-                    Ok(gix::object::tree::diff::Action::Continue(()))
-                },
-            )
+            let target = RepoPathBuf::from_internal_string(dest)
+                .map_err(|err| to_read_object_err(err, head_id))?;
+            if !paths.is_none_or(|paths| paths.contains(&target)) {
+                return Ok(None);
+            }
+
+            Ok(Some(CopyRecord {
+                target,
+                target_commit: head_id.clone(),
+                source: RepoPathBuf::from_internal_string(source)
+                    .map_err(|err| to_read_object_err(err, root_id))?,
+                source_file: FileId::from_bytes(change.old_oid.as_bytes()),
+                source_commit: root_id.clone(),
+            }))
+        };
+
+        let odb = self.grit_repo.odb();
+        let mut changes = grit_lib::diff::diff_trees(odb, Some(&root_tree), Some(&head_tree), "")
             .map_err(|err| BackendError::Other(err.into()))?;
+        // Unlike `git diff -C`, which copies from the preimage of modified
+        // files, jj has always used their new contents as copy sources.
+        for change in &mut changes {
+            if change.status == DiffStatus::Modified {
+                change.old_oid = change.new_oid;
+                change.old_mode.clone_from(&change.new_mode);
+            }
+        }
+        // Renames, and copies from the set of modified files, at 50%
+        // similarity.
+        let changes = grit_lib::diff::detect_copies(odb, None, changes, 50, false, &[])
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let records: Vec<BackendResult<CopyRecord>> = changes
+            .into_iter()
+            .filter_map(|change| change_to_copy_record(change).transpose())
+            .collect();
         Ok(futures::stream::iter(records).boxed())
     }
 
@@ -1751,12 +1696,11 @@ impl Backend for GitBackend {
     /// risk of deleting new commits created concurrently by another process.
     #[tracing::instrument(skip(self, new_heads))]
     async fn gc(&self, new_heads: &[CommitId], keep_newer: SystemTime) -> BackendResult<()> {
-        let git_repo = self.lock_git_repo();
         let new_heads = new_heads
             .iter()
             .filter(|id| *id != &self.root_commit_id)
             .collect();
-        recreate_no_gc_refs(&git_repo, &new_heads, keep_newer)?;
+        recreate_no_gc_refs(&self.grit_repo, &new_heads, keep_newer)?;
 
         // No locking is needed since we aren't going to add new "commits".
         let table = self.cached_extra_metadata_table()?;
@@ -1775,7 +1719,7 @@ impl Backend for GitBackend {
         .map_err(|err| BackendError::Other(err.into()))?;
         // Since "git gc" will move loose refs into packed refs, in-memory
         // packed-refs cache should be invalidated without relying on mtime.
-        git_repo.refs.force_refresh_packed_buffer().ok();
+        self.lock_git_repo().refs.force_refresh_packed_buffer().ok();
         Ok(())
     }
 }

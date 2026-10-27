@@ -71,3 +71,9 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
   before, so commit ids don't change. `.gitignore` matching uses grit's new
   `IgnorePatternList`. grit PRs: standalone ignore pattern list; strip only one
   trailing CR from ignore lines. Tests: 3491/3491.
+- **Step 4**: `refs/jj/keep/*` no-gc refs go through grit's `RefStore`
+  transactions. Copy detection uses `diff_trees` + `detect_copies`. jj keeps
+  its old gix-era semantics: empty files are never copy sources, and modified
+  files are copy sources with their *new* contents. grit PRs: report source
+  modes on copies; only created paths become copy destinations (matches
+  `git diff -C`). Tests: 3491/3491.
