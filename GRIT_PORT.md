@@ -77,3 +77,10 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
   files are copy sources with their *new* contents. grit PRs: report source
   modes on copies; only created paths become copy destinations (matches
   `git diff -C`). Tests: 3491/3491.
+- **Step 5**: ref import/export, HEAD import/detach/reset, linked-worktree
+  HEADs, remote ref rename/removal, fetch pruning and post-push ref updates go
+  through grit-lib (`lib/src/git_grit.rs` has the shared helpers). Reflogs are
+  written the way Git decides (existing reflog or `core.logAllRefUpdates`).
+  Deleting a ref also deletes its reflog, which grit leaves to callers. Three
+  snapshots changed because they print the Git library's error message.
+  Tests: 3491/3491.

@@ -696,9 +696,10 @@ pub async fn cmd_gerrit_upload(
                 qualified_name: remote_ref.clone().into(),
                 targets: Diff::new(
                     None,
-                    Some(gix::ObjectId::from_bytes_or_panic(
-                        new_commit.id().as_bytes(),
-                    )),
+                    Some(
+                        grit_lib::objects::ObjectId::from_bytes(new_commit.id().as_bytes())
+                            .expect("commit id should have valid length"),
+                    ),
                 ),
             }],
             &mut GitSubprocessUi::new(ui),
@@ -713,7 +714,7 @@ pub async fn cmd_gerrit_upload(
             git::GitPushError::NoSuchRemote(_)
             | git::GitPushError::RemoteName(_)
             | git::GitPushError::UnexpectedBackend(_) => user_error(err),
-            git::GitPushError::Subprocess(_) => {
+            git::GitPushError::Subprocess(_) | git::GitPushError::UnexpectedGitError(_) => {
                 user_error_with_message("Internal git error while pushing to gerrit", err)
             }
         })?;

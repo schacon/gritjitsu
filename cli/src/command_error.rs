@@ -625,6 +625,7 @@ jj currently does not support partial clones. To use jj with this repository, tr
                 }
                 GitPushError::Subprocess(_) => user_error(err),
                 GitPushError::UnexpectedBackend(_) => user_error(err),
+                GitPushError::UnexpectedGitError(_) => crate::command_error::internal_error(err),
             }
         }
     }

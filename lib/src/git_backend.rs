@@ -41,6 +41,8 @@ use futures::stream::BoxStream;
 use std::borrow::Cow;
 use std::ops::Range;
 
+use grit_lib::diff::DiffEntry;
+use grit_lib::diff::DiffStatus;
 use grit_lib::objects::HashAlgo;
 use grit_lib::objects::ObjectId as GritObjectId;
 use grit_lib::objects::ObjectKind;
@@ -48,11 +50,8 @@ use grit_lib::objects::TreeEntry as GritTreeEntry;
 use grit_lib::objects::TreeRefIter;
 use grit_lib::objects::serialize_tree;
 use grit_lib::objects::tree_entry_cmp;
-use grit_lib::diff::DiffEntry;
-use grit_lib::diff::DiffStatus;
 use grit_lib::refs::store::Expected;
 use grit_lib::refs::store::RawRef;
-use grit_lib::refs::store::RefTransaction;
 use grit_lib::refs::store::RefUpdate;
 use grit_lib::refs::store::RefUpdateFlags;
 use itertools::Itertools as _;
@@ -175,7 +174,10 @@ impl From<GitBackendError> for BackendError {
 #[derive(Debug, Error)]
 pub enum GitRepoAtWorkdirError {
     #[error("No Git repository found at {path}")]
-    NotFound { path: PathBuf, source: gix::Error },
+    NotFound {
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("Unrelated Git repository found at {path}")]
     Unrelated { path: PathBuf },
     #[error("Failed to open Git repository")]
@@ -206,6 +208,8 @@ pub struct GitBackend {
     cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
+    /// `Name <email>` recorded in reflog entries.
+    reflog_identity: String,
 }
 
 impl GitBackend {
@@ -216,6 +220,7 @@ impl GitBackend {
         grit_repo: grit_lib::repo::Repository,
         extra_metadata_store: TableStore,
         git_settings: GitSettings,
+        reflog_identity: String,
     ) -> Self {
         let repo = base_repo.to_thread_local();
         let hash_algo = grit_repo.odb().hash_algo();
@@ -234,6 +239,7 @@ impl GitBackend {
             cached_extra_metadata: Mutex::new(None),
             git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
+            reflog_identity,
         }
     }
 
@@ -255,7 +261,13 @@ impl GitBackend {
         .map_err(GitBackendInitError::InitRepository)?;
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendInitError::Config)?;
-        Self::init_with_repo(store_path, git_repo_path, git_repo, git_settings)
+        Self::init_with_repo(
+            store_path,
+            git_repo_path,
+            git_repo,
+            git_settings,
+            reflog_identity(settings),
+        )
     }
 
     /// Initializes backend by creating a new Git repo at the specified
@@ -285,7 +297,13 @@ impl GitBackend {
         let git_repo_path = workspace_root.join(".git");
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendInitError::Config)?;
-        Self::init_with_repo(store_path, &git_repo_path, git_repo, git_settings)
+        Self::init_with_repo(
+            store_path,
+            &git_repo_path,
+            git_repo,
+            git_settings,
+            reflog_identity(settings),
+        )
     }
 
     /// Initializes backend with an existing Git repo at the specified path.
@@ -307,7 +325,13 @@ impl GitBackend {
         .map_err(GitBackendInitError::OpenRepository)?;
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendInitError::Config)?;
-        Self::init_with_repo(store_path, git_repo_path, git_repo, git_settings)
+        Self::init_with_repo(
+            store_path,
+            git_repo_path,
+            git_repo,
+            git_settings,
+            reflog_identity(settings),
+        )
     }
 
     fn init_with_repo(
@@ -315,6 +339,7 @@ impl GitBackend {
         git_repo_path: &Path,
         repo: gix::ThreadSafeRepository,
         git_settings: GitSettings,
+        reflog_identity: String,
     ) -> Result<Self, Box<GitBackendInitError>> {
         let extra_path = store_path.join("extra");
         fs::create_dir(&extra_path)
@@ -340,7 +365,13 @@ impl GitBackend {
         let grit_repo =
             open_grit_repo(repo.path()).map_err(GitBackendInitError::OpenGritRepository)?;
         let extra_metadata_store = TableStore::init(extra_path, grit_repo.odb().hash_algo().len());
-        Ok(Self::new(repo, grit_repo, extra_metadata_store, git_settings))
+        Ok(Self::new(
+            repo,
+            grit_repo,
+            extra_metadata_store,
+            git_settings,
+            reflog_identity,
+        ))
     }
 
     pub fn load(
@@ -370,7 +401,13 @@ impl GitBackend {
             TableStore::load(store_path.join("extra"), grit_repo.odb().hash_algo().len());
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendLoadError::Config)?;
-        Ok(Self::new(repo, grit_repo, extra_metadata_store, git_settings))
+        Ok(Self::new(
+            repo,
+            grit_repo,
+            extra_metadata_store,
+            git_settings,
+            reflog_identity(settings),
+        ))
     }
 
     fn lock_git_repo(&self) -> MutexGuard<'_, gix::Repository> {
@@ -382,6 +419,66 @@ impl GitBackend {
     /// Use [`Self::open_git_repo_at_workdir()`] for worktree operations.
     pub fn git_repo(&self) -> gix::Repository {
         self.base_repo.to_thread_local()
+    }
+
+    /// Returns the grit-lib handle for the underlying Git repository.
+    pub fn grit_repo(&self) -> &grit_lib::repo::Repository {
+        &self.grit_repo
+    }
+
+    /// Opens a new grit-lib handle for the underlying Git repository, picking
+    /// up configuration changes made since this backend was loaded.
+    pub fn reopen_grit_repo(&self) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+        open_grit_repo(self.grit_repo.git_dir())
+    }
+
+    /// `Name <email>` to record in reflog entries.
+    pub(crate) fn reflog_identity(&self) -> &str {
+        &self.reflog_identity
+    }
+
+    /// Opens the repository at the given workspace path with grit-lib.
+    ///
+    /// For a linked Git worktree, the returned repository's HEAD is the
+    /// worktree's HEAD.
+    pub fn open_grit_repo_at_workdir(
+        &self,
+        path: &Path,
+    ) -> Result<grit_lib::repo::Repository, GitRepoAtWorkdirError> {
+        let open_repo = &self.grit_repo;
+        if let Some(workdir) = open_repo.work_tree()
+            && (workdir == path || dunce::canonicalize(path).is_ok_and(|path| workdir == path))
+        {
+            return open_grit_repo_with_work_tree(open_repo.git_dir(), Some(workdir))
+                .map_err(|err| GitRepoAtWorkdirError::Other(err.into()));
+        }
+
+        let dot_git = path.join(".git");
+        let git_dir = grit_lib::repo::resolve_dot_git(&dot_git).map_err(|source| {
+            if dot_git.exists() {
+                GitRepoAtWorkdirError::Other(source.into())
+            } else {
+                let path = path.to_owned();
+                GitRepoAtWorkdirError::NotFound {
+                    path,
+                    source: source.into(),
+                }
+            }
+        })?;
+        let work_repo = open_grit_repo_with_work_tree(&git_dir, Some(path))
+            .map_err(|err| GitRepoAtWorkdirError::Other(err.into()))?;
+        let canonicalize = |path: &Path| {
+            dunce::canonicalize(path).map_err(|err| GitRepoAtWorkdirError::Other(err.into()))
+        };
+        if open_repo.common_git_dir() == work_repo.common_git_dir()
+            || canonicalize(open_repo.common_git_dir())?
+                == canonicalize(work_repo.common_git_dir())?
+        {
+            Ok(work_repo)
+        } else {
+            let path = path.to_owned();
+            Err(GitRepoAtWorkdirError::Unrelated { path })
+        }
     }
 
     /// Reopens the repository at the given workspace path. Returns a new
@@ -404,7 +501,10 @@ impl GitBackend {
             .map_err(|source| {
                 if source.is_not_found() {
                     let path = path.to_owned();
-                    GitRepoAtWorkdirError::NotFound { path, source }
+                    GitRepoAtWorkdirError::NotFound {
+                        path,
+                        source: source.into(),
+                    }
                 } else {
                     GitRepoAtWorkdirError::Other(source.into())
                 }
@@ -568,10 +668,39 @@ fn gix_open_opts_from_settings(settings: &UserSettings) -> gix::open::Options {
 
 /// Opens the Git repository at `git_dir` with grit-lib.
 fn open_grit_repo(git_dir: &Path) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
-    let options = grit_lib::prelude::RepositoryOptions::with_environment(
+    open_grit_repo_with_work_tree(git_dir, None)
+}
+
+fn open_grit_repo_with_work_tree(
+    git_dir: &Path,
+    work_tree: Option<&Path>,
+) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+    let mut options = grit_lib::prelude::RepositoryOptions::with_environment(
         grit_lib::prelude::Environment::capture_process(),
     );
+    if let Some(work_tree) = work_tree {
+        options = options.with_work_tree(work_tree);
+    }
     grit_lib::repo::Repository::open(git_dir, &options)
+}
+
+/// Formats the user as `Name <email>` for reflog entries.
+fn reflog_identity(settings: &UserSettings) -> String {
+    // Git rejects reflog identities with angle brackets or newlines, and
+    // empty names. Empty values are written like in commits.
+    let clean = |value: &str| {
+        let value = value.replace(['<', '>', '\n'], "");
+        if value.is_empty() {
+            EMPTY_STRING_PLACEHOLDER.to_owned()
+        } else {
+            value
+        }
+    };
+    format!(
+        "{} <{}>",
+        clean(settings.user_name()),
+        clean(settings.user_email())
+    )
 }
 
 /// Reads the shallow roots recorded in `$GIT_DIR/shallow`.
@@ -1085,19 +1214,7 @@ fn edit_references(
     repo: &grit_lib::repo::Repository,
     updates: impl IntoIterator<Item = RefUpdate>,
 ) -> BackendResult<()> {
-    let mut transaction = RefTransaction::new();
-    for update in updates {
-        transaction
-            .push_update(update)
-            .map_err(|err| BackendError::Other(err.into()))?;
-    }
-    if transaction.updates().is_empty() {
-        return Ok(());
-    }
-    repo.refs()
-        .prepare(transaction)
-        .and_then(|prepared| prepared.commit())
-        .map_err(|err| BackendError::Other(err.into()))
+    crate::git_grit::edit_refs(repo, updates).map_err(|err| BackendError::Other(err.into()))
 }
 
 /// Recreates `refs/jj/keep` refs for the `new_heads`, and removes the other
@@ -2396,8 +2513,7 @@ mod tests {
             signature_from_git(b"JJ_EMPTY_STRING <git.author@example.com> 1000 +0100").unwrap();
         assert!(signature1.name.is_empty());
         assert_eq!(signature1.email, "git.author@example.com");
-        let signature2 =
-            signature_from_git(b"git committer <JJ_EMPTY_STRING> 2000 -0800").unwrap();
+        let signature2 = signature_from_git(b"git committer <JJ_EMPTY_STRING> 2000 -0800").unwrap();
         assert_eq!(signature2.name, "git committer");
         assert!(signature2.email.is_empty());
     }
@@ -2413,7 +2529,10 @@ mod tests {
             },
         };
         let git_signature1 = signature_to_git(&signature1, 0).unwrap();
-        assert_eq!(git_signature1, b"JJ_EMPTY_STRING <someone@example.com> 0 +0000");
+        assert_eq!(
+            git_signature1,
+            b"JJ_EMPTY_STRING <someone@example.com> 0 +0000"
+        );
         let signature2 = Signature {
             name: "Someone".to_string(),
             email: "".to_string(),
@@ -2884,4 +3003,3 @@ mod tests {
         UserSettings::from_config_and_home_dir(config, None).unwrap()
     }
 }
-

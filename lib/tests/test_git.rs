@@ -161,6 +161,10 @@ fn git_id(commit: &Commit) -> gix::ObjectId {
     gix::ObjectId::from_bytes_or_panic(commit.id().as_bytes())
 }
 
+fn git_oid(commit: &Commit) -> grit_lib::objects::ObjectId {
+    grit_lib::objects::ObjectId::from_bytes(commit.id().as_bytes()).unwrap()
+}
+
 fn remote_symbol<'a, N, M>(name: &'a N, remote: &'a M) -> RemoteRefSymbol<'a>
 where
     N: AsRef<RefName> + ?Sized,
@@ -6451,7 +6455,7 @@ fn test_push_updates_unexpectedly_moved_sideways_on_remote() -> TestResult {
         let targets = [GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
             targets: Diff::new(Some(&setup.sideways_commit), target)
-                .map(|commit| commit.map(git_id)),
+                .map(|commit| commit.map(git_oid)),
         }];
         git::push_updates(
             setup.jj_repo.as_ref(),
@@ -6535,7 +6539,7 @@ fn test_push_updates_unexpectedly_moved_forward_on_remote() -> TestResult {
         let targets = [GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
             targets: Diff::new(Some(&setup.parent_of_main_commit), target)
-                .map(|commit| commit.map(git_id)),
+                .map(|commit| commit.map(git_oid)),
         }];
         git::push_updates(
             setup.jj_repo.as_ref(),
@@ -6600,7 +6604,7 @@ fn test_push_updates_unexpectedly_exists_on_remote() -> TestResult {
         let subprocess_options = GitSubprocessOptions::from_settings(&settings).unwrap();
         let targets = [GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
-            targets: Diff::new(None, target).map(|commit| commit.map(git_id)),
+            targets: Diff::new(None, target).map(|commit| commit.map(git_oid)),
         }];
         git::push_updates(
             setup.jj_repo.as_ref(),
@@ -6643,7 +6647,7 @@ fn test_push_updates_success() -> TestResult {
         &[GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
             targets: Diff::new(&setup.main_commit, &setup.child_of_main_commit)
-                .map(|commit| Some(git_id(commit))),
+                .map(|commit| Some(git_oid(commit))),
         }],
         &mut NullCallback,
         &GitPushOptions::default(),
@@ -6685,7 +6689,7 @@ fn test_push_updates_no_such_remote() -> TestResult {
         &[GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
             targets: Diff::new(&setup.main_commit, &setup.child_of_main_commit)
-                .map(|commit| Some(git_id(commit))),
+                .map(|commit| Some(git_oid(commit))),
         }],
         &mut NullCallback,
         &GitPushOptions::default(),
@@ -6707,7 +6711,7 @@ fn test_push_updates_invalid_remote() -> TestResult {
         &[GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
             targets: Diff::new(&setup.main_commit, &setup.child_of_main_commit)
-                .map(|commit| Some(git_id(commit))),
+                .map(|commit| Some(git_oid(commit))),
         }],
         &mut NullCallback,
         &GitPushOptions::default(),
@@ -7432,7 +7436,7 @@ fn test_push_updates_with_options() -> TestResult {
         &[GitRefUpdate {
             qualified_name: "refs/heads/main".into(),
             targets: Diff::new(&setup.main_commit, &setup.child_of_main_commit)
-                .map(|commit| Some(git_id(commit))),
+                .map(|commit| Some(git_oid(commit))),
         }],
         &mut callback,
         &GitPushOptions {
