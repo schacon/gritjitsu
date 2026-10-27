@@ -79,7 +79,6 @@ dunce = { workspace = true }
 erased-serde = { workspace = true }
 etcetera = { workspace = true }
 futures = { workspace = true }
-gix = { workspace = true, optional = true }
 grit-lib = { workspace = true, optional = true }
 globset = { workspace = true }
 indexmap = { workspace = true }
@@ -139,7 +138,7 @@ jj-cli = { path = ".", features = ["test-fakes"], default-features = false }
 [features]
 default = ["watchman", "git"]
 bench = ["dep:criterion"]
-git = ["jj-lib/git", "dep:gix", "dep:grit-lib"]
+git = ["jj-lib/git", "dep:grit-lib"]
 test-fakes = ["jj-lib/testing"]
 watchman = ["jj-lib/watchman"]
 

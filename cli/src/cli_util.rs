@@ -1063,14 +1063,10 @@ impl WorkspaceCommandEnvironment {
     #[cfg(feature = "git")]
     #[instrument(skip_all)]
     pub fn base_ignores(&self, store: &Store) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
-        let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
-            // TODO: maybe use path() and interpolate(), which can process non-utf-8
-            // path on Unix.
-            if let Some(value) = config.string("core.excludesFile") {
+        let get_excludes_file_path = |config: &grit_lib::config::ConfigSet| -> Option<PathBuf> {
+            if let Some(value) = config.get("core.excludesFile") {
                 let home_dir = self.command.config_env().home_dir();
-                let path = str::from_utf8(&value)
-                    .ok()
-                    .map(|value| jj_lib::file_util::expand_home_path(value, home_dir))?;
+                let path = jj_lib::file_util::expand_home_path(&value, home_dir);
                 // The configured path is usually absolute, but if it's relative,
                 // the "git" command would read the file at the work-tree directory.
                 Some(self.workspace_root().join(path))
@@ -1090,16 +1086,19 @@ impl WorkspaceCommandEnvironment {
 
         let mut git_ignores = GitIgnoreFile::empty();
         if let Ok(git_backend) = jj_lib::git::get_git_backend(store) {
-            let git_repo = git_backend.git_repo();
-            if let Some(excludes_file_path) = get_excludes_file_path(&git_repo.config_snapshot()) {
+            let git_config = git_backend.git_repo().config().ok();
+            if let Some(excludes_file_path) = git_config.and_then(|c| get_excludes_file_path(&c)) {
                 git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
             }
             git_ignores = git_ignores.chain_with_file(
                 RepoPath::root(),
                 git_backend.git_repo_path().join("info").join("exclude"),
             )?;
-        } else if let Ok(git_config) = gix::config::File::from_globals()
-            && let Some(excludes_file_path) = get_excludes_file_path(&git_config)
+        } else if let Ok(git_config) = grit_lib::config::ConfigSet::load(
+            &grit_lib::prelude::Environment::capture_process(),
+            None,
+            true,
+        ) && let Some(excludes_file_path) = get_excludes_file_path(&git_config)
         {
             git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
         }

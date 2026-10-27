@@ -228,7 +228,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
-        object_hash: gix::hash::Kind,
+        object_hash: grit_lib::objects::HashAlgo,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer: &BackendInitializer = &|settings, store_path| {
             Ok(Box::new(crate::git_backend::GitBackend::init_internal(
@@ -255,7 +255,7 @@ impl Workspace {
         user_settings: &UserSettings,
         workspace_root: &Path,
         workspace_name: &WorkspaceName,
-        object_hash: gix::hash::Kind,
+        object_hash: grit_lib::objects::HashAlgo,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let backend_initializer = |settings: &UserSettings,
                                    store_path: &Path|

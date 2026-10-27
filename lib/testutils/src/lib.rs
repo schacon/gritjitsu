@@ -108,7 +108,7 @@ pub const HERMETIC_GIT_CONFIGS: &[(&str, &str)] = &[
 
 // TODO: Consider figuring out a way to make `GitBackend` and `git(1)` calls in
 // tests ignore external configuration and removing this function. This is
-// somewhat tricky because `gix` looks at system and user configuration, and
+// somewhat tricky because Git looks at system and user configuration, and
 // `GitBackend` also calls into `git(1)` for things like garbage collection.
 pub fn hermetic_git() {
     let mut envs = [
@@ -282,7 +282,7 @@ impl TestRepoBackend {
             Self::Git => Ok(Box::new(GitBackend::init_internal(
                 settings,
                 store_path,
-                gix::hash::Kind::default(),
+                grit_lib::objects::HashAlgo::default(),
             )?)),
             Self::Simple => Ok(Box::new(SimpleBackend::init(store_path))),
             Self::Test => Ok(Box::new(env.test_backend_factory.init(store_path))),
@@ -400,7 +400,7 @@ impl TestWorkspace {
             &user_settings(),
             &workspace_root,
             WorkspaceName::DEFAULT,
-            gix::hash::Kind::default(),
+            grit_lib::objects::HashAlgo::default(),
         )
         .block_on()
         .unwrap();

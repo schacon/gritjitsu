@@ -288,7 +288,7 @@ enum ObjectHash {
     Sha256,
 }
 
-impl From<ObjectHash> for gix::hash::Kind {
+impl From<ObjectHash> for grit_lib::objects::HashAlgo {
     fn from(value: ObjectHash) -> Self {
         match value {
             ObjectHash::Sha1 => Self::Sha1,

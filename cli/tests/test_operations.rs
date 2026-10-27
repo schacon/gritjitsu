@@ -3895,7 +3895,7 @@ fn test_op_diff_invalid_revset() {
     ");
 }
 
-fn init_bare_git_repo(git_repo_path: &Path) -> gix::Repository {
+fn init_bare_git_repo(git_repo_path: &Path) -> testutils::git::Repository {
     let git_repo = git::init_bare(git_repo_path);
     let commit_result = git::add_commit(
         &git_repo,
@@ -3933,7 +3933,7 @@ fn init_bare_git_repo(git_repo_path: &Path) -> gix::Repository {
     git_repo
 }
 
-fn modify_git_repo(git_repo: gix::Repository) -> gix::Repository {
+fn modify_git_repo(git_repo: testutils::git::Repository) -> testutils::git::Repository {
     let bookmark1_commit = git_repo
         .find_reference("refs/heads/bookmark-1")
         .unwrap()
@@ -3953,14 +3953,14 @@ fn modify_git_repo(git_repo: gix::Repository) -> gix::Repository {
         "next-file",
         b"more content",
         "Commit 4",
-        &[bookmark1_commit.detach()],
+        &[bookmark1_commit],
     );
     git::write_commit(
         &git_repo,
         "refs/heads/bookmark-2",
         commit_result.tree_id,
         "Commit 5",
-        &[bookmark2_commit.detach()],
+        &[bookmark2_commit],
     );
 
     git_repo

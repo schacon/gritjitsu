@@ -18,13 +18,12 @@ use std::error;
 use std::io;
 use std::io::Write as _;
 use std::iter;
-use std::mem;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use bstr::ByteSlice as _;
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
 use indoc::writedoc;
@@ -44,6 +43,7 @@ use jj_lib::git::GitSubprocessCallback;
 use jj_lib::git::GitSubprocessOptions;
 use jj_lib::git_backend::GitRepoAtWorkdirError;
 use jj_lib::op_store::RemoteRefState;
+use jj_lib::ref_name::RemoteName;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo;
 use jj_lib::settings::RemoteSettingsMap;
@@ -76,33 +76,127 @@ pub fn is_colocated_git_workspace(workspace: &Workspace) -> Result<bool, Command
     }
 }
 
+/// How Git interprets a remote location.
+#[derive(Debug, Eq, PartialEq)]
+enum GitUrl<'a> {
+    /// `scheme://[user@]host[:port]/path`
+    Url {
+        scheme: &'a str,
+        host: &'a str,
+        path: &'a str,
+    },
+    /// scp-like syntax `[user@]host:path`
+    Scp { host: &'a str, path: &'a str },
+    /// A local path
+    Path(&'a str),
+}
+
+impl<'a> GitUrl<'a> {
+    /// Classifies `source` the way Git does (see `url_is_local_not_ssh()` in
+    /// Git's `connect.c`).
+    fn parse(source: &'a str) -> Self {
+        if let Some((scheme, rest)) = source.split_once("://")
+            && !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let host = if let Some(bracketed) = host.strip_prefix('[') {
+                bracketed
+                    .split_once(']')
+                    .map_or(bracketed, |(host, _)| host)
+            } else {
+                host.split_once(':').map_or(host, |(host, _)| host)
+            };
+            return Self::Url { scheme, host, path };
+        }
+        // A colon before the first slash means scp-like syntax, unless it's a
+        // DOS drive letter.
+        let colon = source.find(':');
+        let slash = source.find('/');
+        let is_dos_drive = cfg!(windows)
+            && source.len() >= 2
+            && source.as_bytes()[0].is_ascii_alphabetic()
+            && source.as_bytes()[1] == b':';
+        if let Some(colon) = colon
+            && slash.is_none_or(|slash| colon < slash)
+            && !is_dos_drive
+        {
+            let (user_host, path) = source.split_at(colon);
+            let host = user_host
+                .rsplit_once('@')
+                .map_or(user_host, |(_, host)| host);
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            return Self::Scp {
+                host,
+                path: &path[1..],
+            };
+        }
+        Self::Path(source)
+    }
+}
+
 /// Parses user-specified remote URL or path to absolute form.
 pub fn absolute_git_url(cwd: &Path, source: &str) -> Result<String, CommandError> {
     // Git appears to turn URL-like source to absolute path if local git directory
     // exits, and fails because '$PWD/https' is unsupported protocol. Since it would
-    // be tedious to copy the exact git (or libgit2) behavior, we simply let gix
-    // parse the input as URL, rcp-like, or local path.
-    let mut url = gix::url::parse(source).map_err(cli_error)?;
-    url.canonicalize(cwd).map_err(user_error)?;
-    // As of gix 0.68.0, the canonicalized path uses platform-native directory
-    // separator, which isn't compatible with libgit2 on Windows.
-    if url.scheme == gix::url::Scheme::File {
-        url.path = gix::path::to_unix_separators_on_windows(mem::take(&mut url.path)).into_owned();
+    // be tedious to copy the exact git behavior, we simply parse the input as URL,
+    // rcp-like, or local path.
+    if source.is_empty() {
+        return Err(cli_error(
+            "local path is empty and does not specify a path to a repository",
+        ));
     }
-    // It's less likely that cwd isn't utf-8, so just fall back to original source.
-    Ok(String::from_utf8(url.to_bstring().into()).unwrap_or_else(|_| source.to_owned()))
+    match GitUrl::parse(source) {
+        GitUrl::Url { .. } | GitUrl::Scp { .. } => Ok(source.to_owned()),
+        GitUrl::Path(path) => {
+            let path = normalize_path(&cwd.join(path));
+            // Use '/' as directory separator, which Git also accepts on Windows.
+            // It's less likely that cwd isn't utf-8, so just fall back to original
+            // source.
+            Ok(path
+                .to_str()
+                .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+                .unwrap_or_else(|| source.to_owned()))
+        }
+    }
+}
+
+/// Removes `.` and resolves `..` components without touching the file system.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component);
+                }
+            }
+            _ => normalized.push(component),
+        }
+    }
+    normalized
 }
 
 /// Converts a git remote URL to a normalized HTTPS URL for web browsing.
 ///
 /// Returns `None` if the URL cannot be converted.
-fn git_remote_url_to_web(url: &gix::Url) -> Option<String> {
-    if url.scheme == gix::url::Scheme::File || url.host().is_none() {
+fn git_remote_url_to_web(url: &str) -> Option<String> {
+    let (host, path) = match GitUrl::parse(url) {
+        GitUrl::Url { scheme: "file", .. } | GitUrl::Path(_) => return None,
+        GitUrl::Url { host, path, .. } | GitUrl::Scp { host, path } => (host, path),
+    };
+    if host.is_empty() {
         return None;
     }
-
-    let host = url.host()?;
-    let path = url.path.to_str().ok()?;
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
 
@@ -115,10 +209,8 @@ fn git_remote_url_to_web(url: &gix::Url) -> Option<String> {
 /// Returns `None` if the remote doesn't exist or its URL cannot be converted.
 pub fn get_remote_web_url(repo: &ReadonlyRepo, remote_name: &str) -> Option<String> {
     let git_repo = git::get_git_repo(repo.store()).ok()?;
-    let remote = git_repo.try_find_remote(remote_name)?.ok()?;
-    let url = remote
-        .url(gix::remote::Direction::Fetch)
-        .or_else(|| remote.url(gix::remote::Direction::Push))?;
+    let remote = git::try_find_active_remote(&git_repo, RemoteName::new(remote_name)).ok()??;
+    let url = remote.fetch_url().or_else(|| remote.push_url())?;
     git_remote_url_to_web(url)
 }
 
@@ -589,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_absolute_git_url() {
-        // gix::Url::canonicalize() works even if the path doesn't exist.
+        // absolute_git_url() works even if the path doesn't exist.
         // However, we need to ensure that no symlinks exist at the test paths.
         let temp_dir = testutils::new_temp_dir();
         let cwd = dunce::canonicalize(temp_dir.path()).unwrap();
@@ -628,7 +720,7 @@ mod tests {
             absolute_git_url(&cwd, "custom://example.org/foo.git").unwrap(),
             "custom://example.org/foo.git"
         );
-        // Password shouldn't be redacted (gix::Url::to_string() would do)
+        // Password shouldn't be redacted
         assert_eq!(
             absolute_git_url(&cwd, "https://user:pass@example.org/").unwrap(),
             "https://user:pass@example.org/"
@@ -649,7 +741,7 @@ mod tests {
 
     #[test]
     fn test_git_remote_url_to_web() {
-        let to_web = |s| git_remote_url_to_web(&gix::Url::try_from(s).unwrap());
+        let to_web = git_remote_url_to_web;
 
         // SSH URL
         assert_eq!(

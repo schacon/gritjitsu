@@ -2768,33 +2768,39 @@ fn test_workspaces_add_colocated_unborn_head() {
 
 /// Returns the repo's Git HEAD: the ref name if HEAD points at a ref, or the
 /// commit id if HEAD is detached.
-fn git_head(repo: &gix::Repository) -> String {
-    match repo.head().unwrap().kind {
-        gix::head::Kind::Unborn(name) => name.as_bstr().to_string(),
-        gix::head::Kind::Symbolic(reference) => reference.name.as_bstr().to_string(),
-        gix::head::Kind::Detached { target, .. } => target.to_string(),
+fn git_head(repo: &testutils::git::Repository) -> String {
+    let head = repo.head().unwrap();
+    match head.name() {
+        Some(name) => name.to_string(),
+        None => repo.head_id().unwrap().to_string(),
     }
 }
 
-fn local_branches(repo: &gix::Repository) -> Vec<String> {
+fn local_branches(repo: &testutils::git::Repository) -> Vec<String> {
     let mut names = repo
-        .references()
+        .list_references("refs/heads/")
         .unwrap()
-        .local_branches()
-        .unwrap()
-        .map(|reference| reference.unwrap().name().as_bstr().to_string())
+        .iter()
+        .map(|reference| reference.name().to_string())
         .collect::<Vec<_>>();
     names.sort();
     names
 }
 
 /// Returns the ids of the linked Git worktrees registered in the repo.
-fn git_worktree_ids(repo: &gix::Repository) -> Vec<String> {
+fn git_worktree_ids(repo: &testutils::git::Repository) -> Vec<String> {
     let mut ids = repo
         .worktrees()
         .unwrap()
         .iter()
-        .map(|proxy| proxy.id().unwrap().to_string())
+        .map(|entry| {
+            entry
+                .admin_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect::<Vec<_>>();
     ids.sort();
     ids

@@ -13,10 +13,7 @@ async-trait = { workspace = true }
 bstr = { workspace = true }
 eyre = { workspace = true }
 futures = { workspace = true }
-gix = { workspace = true, features = [
-    "status",
-    "worktree-mutation",
-] }
+grit-lib = { workspace = true }
 itertools = { workspace = true }
 jj-lib = { workspace = true, features = ["testing"] }
 pollster = { workspace = true }

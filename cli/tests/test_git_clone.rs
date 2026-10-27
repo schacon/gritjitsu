@@ -24,11 +24,11 @@ use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::to_toml_value;
 
-fn set_up_non_empty_git_repo(git_repo: &gix::Repository) {
+fn set_up_non_empty_git_repo(git_repo: &testutils::git::Repository) {
     set_up_git_repo_with_file(git_repo, "file");
 }
 
-fn set_up_git_repo_with_file(git_repo: &gix::Repository, filename: &str) {
+fn set_up_git_repo_with_file(git_repo: &testutils::git::Repository, filename: &str) {
     git::add_commit(
         git_repo,
         "refs/heads/main",
@@ -196,21 +196,21 @@ fn test_git_clone_bad_source() {
     let root_dir = test_env.work_dir("");
 
     let output = root_dir.run_jj(["git", "clone", "", "dest"]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: local path is empty and does not specify a path to a repository, input=""
+    Error: local path is empty and does not specify a path to a repository
     [EOF]
     [exit status: 2]
-    "#);
+    ");
 
     // Invalid URL unparsable by gitoxide
     let output = root_dir.run_jj(["git", "clone", "https://", "dest"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    Error: URL can not be parsed as valid URL, input="https://"
-    Caused by: Scheme requires host
+    Fetching into new repo in "$TEST_ENV/dest"
+    Error: No git remote named 'origin'
     [EOF]
-    [exit status: 2]
+    [exit status: 1]
     "#);
 }
 
@@ -301,12 +301,8 @@ fn test_git_clone_colocate() -> TestResult {
     assert_eq!(
         jj_git_repo
             .head_id()
-            .expect("Clone Repo HEAD should be set.")
-            .detach(),
-        git_repo
-            .head_id()
-            .expect("Repo HEAD should be set.")
-            .detach(),
+            .expect("Clone Repo HEAD should be set."),
+        git_repo.head_id().expect("Repo HEAD should be set."),
     );
     // ".jj" directory should be ignored at Git side.
     let git_statuses = git::status(&jj_git_repo);
@@ -623,11 +619,11 @@ fn test_git_clone_remote_default_bookmark() -> TestResult {
     set_up_non_empty_git_repo(&git_repo);
 
     // Create non-default bookmark in remote
-    let head_id = git_repo.head_id()?.detach();
+    let head_id = git_repo.head_id()?;
     git_repo.reference(
         "refs/heads/feature1",
         head_id,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
 

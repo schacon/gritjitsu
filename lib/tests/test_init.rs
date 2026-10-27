@@ -52,9 +52,9 @@ fn test_init_local() -> TestResult {
     Ok(())
 }
 
-#[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-#[test_case(gix::hash::Kind::Sha256; "sha256")]
-fn test_init_internal_git(object_hash: gix::hash::Kind) -> TestResult {
+#[test_case(testutils::git::HashAlgo::Sha1 ; "sha1")]
+#[test_case(testutils::git::HashAlgo::Sha256; "sha256")]
+fn test_init_internal_git(object_hash: testutils::git::HashAlgo) -> TestResult {
     let settings = testutils::user_settings();
     let temp_dir = testutils::new_temp_dir();
     let (canonical, uncanonical) = canonicalize(temp_dir.path());
@@ -68,7 +68,7 @@ fn test_init_internal_git(object_hash: gix::hash::Kind) -> TestResult {
         git_backend.git_repo_path(),
         canonical.join(PathBuf::from_iter([".jj", "repo", "store", "git"])),
     );
-    assert!(git_backend.git_repo().workdir().is_none());
+    assert!(git_backend.git_repo().work_tree().is_none());
     assert_eq!(
         std::fs::read_to_string(repo_path.join("store").join("git_target"))?,
         "git"
@@ -80,9 +80,9 @@ fn test_init_internal_git(object_hash: gix::hash::Kind) -> TestResult {
     Ok(())
 }
 
-#[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-#[test_case(gix::hash::Kind::Sha256; "sha256")]
-fn test_init_colocated_git(object_hash: gix::hash::Kind) -> TestResult {
+#[test_case(testutils::git::HashAlgo::Sha1 ; "sha1")]
+#[test_case(testutils::git::HashAlgo::Sha256; "sha256")]
+fn test_init_colocated_git(object_hash: testutils::git::HashAlgo) -> TestResult {
     let settings = testutils::user_settings();
     let temp_dir = testutils::new_temp_dir();
     let (canonical, uncanonical) = canonicalize(temp_dir.path());
@@ -93,7 +93,7 @@ fn test_init_colocated_git(object_hash: gix::hash::Kind) -> TestResult {
     let repo_path = canonical.join(".jj").join("repo");
     assert_eq!(workspace.workspace_root(), &canonical);
     assert_eq!(git_backend.git_repo_path(), canonical.join(".git"));
-    assert_eq!(git_backend.git_repo().workdir(), Some(canonical.as_ref()));
+    assert_eq!(git_backend.git_repo().work_tree(), Some(canonical.as_ref()));
     assert_eq!(
         std::fs::read_to_string(repo_path.join("store").join("git_target"))?,
         "../../../.git"
@@ -127,7 +127,7 @@ fn test_init_external_git() -> TestResult {
         canonical.join("git").join(".git")
     );
     assert_eq!(
-        git_backend.git_repo().workdir(),
+        git_backend.git_repo().work_tree(),
         Some(canonical.join("git").as_ref())
     );
 

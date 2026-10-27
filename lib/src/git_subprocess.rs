@@ -494,10 +494,10 @@ pub struct GitRefUpdates {
     /// `old_oid`/`new_oid` may be null or point to non-commit objects such as
     /// tags.
     #[cfg_attr(not(test), expect(dead_code))] // unused as of now
-    pub updated: Vec<(GitRefNameBuf, Diff<gix::ObjectId>)>,
+    pub updated: Vec<(GitRefNameBuf, Diff<grit_lib::objects::ObjectId>)>,
     /// Git ref `(name, (old_oid, new_oid)`s that are rejected or failed to
     /// update.
-    pub rejected: Vec<(GitRefNameBuf, Diff<gix::ObjectId>)>,
+    pub rejected: Vec<(GitRefNameBuf, Diff<grit_lib::objects::ObjectId>)>,
 }
 
 /// Parses porcelain output of `git fetch`.
@@ -527,8 +527,13 @@ fn parse_ref_updates(stdout: &[u8]) -> Result<GitRefUpdates, GitSubprocessError>
         let name: GitRefNameBuf = str::from_utf8(name)
             .map_err(|_| parse_err("non-UTF-8 ref name"))?
             .into();
-        let old_oid = gix::ObjectId::from_hex(old_oid).map_err(|_| parse_err("invalid old oid"))?;
-        let new_oid = gix::ObjectId::from_hex(new_oid).map_err(|_| parse_err("invalid new oid"))?;
+        let parse_oid = |hex: &[u8]| {
+            str::from_utf8(hex)
+                .ok()
+                .and_then(|hex| grit_lib::objects::ObjectId::from_hex(hex).ok())
+        };
+        let old_oid = parse_oid(old_oid).ok_or_else(|| parse_err("invalid old oid"))?;
+        let new_oid = parse_oid(new_oid).ok_or_else(|| parse_err("invalid new oid"))?;
         let oid_diff = Diff::new(old_oid, new_oid);
         match flag {
             // ' ' for a successfully fetched fast-forward
@@ -1147,8 +1152,8 @@ Done";
                         "refs/remotes/origin/a1",
                     ),
                     Diff {
-                        before: Sha1(0000000000000000000000000000000000000000),
-                        after: Sha1(e80d998ab04be7caeac3a732d74b1708aa3d8b26),
+                        before: ObjectId(0000000000000000000000000000000000000000),
+                        after: ObjectId(e80d998ab04be7caeac3a732d74b1708aa3d8b26),
                     },
                 ),
                 (
@@ -1156,8 +1161,8 @@ Done";
                         "refs/remotes/origin/a2",
                     ),
                     Diff {
-                        before: Sha1(ebeb70d8c5f972275f0a22f7af6bc9ddb175ebd9),
-                        after: Sha1(9175cb3250fd266fe46dcc13664b255a19234286),
+                        before: ObjectId(ebeb70d8c5f972275f0a22f7af6bc9ddb175ebd9),
+                        after: ObjectId(9175cb3250fd266fe46dcc13664b255a19234286),
                     },
                 ),
                 (
@@ -1165,8 +1170,8 @@ Done";
                         "refs/remotes/origin/a3",
                     ),
                     Diff {
-                        before: Sha1(c8303692b8e2f0326cd33873a157b4fa69d54774),
-                        after: Sha1(798c5e2435e1442946db90a50d47ab90f40c60b7),
+                        before: ObjectId(c8303692b8e2f0326cd33873a157b4fa69d54774),
+                        after: ObjectId(798c5e2435e1442946db90a50d47ab90f40c60b7),
                     },
                 ),
                 (
@@ -1174,8 +1179,8 @@ Done";
                         "refs/remotes/origin/a4",
                     ),
                     Diff {
-                        before: Sha1(b2ea51c027e11c0f2871cce2a52e648e194df771),
-                        after: Sha1(0000000000000000000000000000000000000000),
+                        before: ObjectId(b2ea51c027e11c0f2871cce2a52e648e194df771),
+                        after: ObjectId(0000000000000000000000000000000000000000),
                     },
                 ),
                 (
@@ -1183,8 +1188,8 @@ Done";
                         "refs/tags/v1.0",
                     ),
                     Diff {
-                        before: Sha1(0000000000000000000000000000000000000000),
-                        after: Sha1(fd5b6a095a77575c94fad4164ab580331316c374),
+                        before: ObjectId(0000000000000000000000000000000000000000),
+                        after: ObjectId(fd5b6a095a77575c94fad4164ab580331316c374),
                     },
                 ),
                 (
@@ -1192,8 +1197,8 @@ Done";
                         "refs/tags/v2.0",
                     ),
                     Diff {
-                        before: Sha1(0000000000000000000000000000000000000000),
-                        after: Sha1(3262fedde0224462bb6ac3015dabc427a4f98316),
+                        before: ObjectId(0000000000000000000000000000000000000000),
+                        after: ObjectId(3262fedde0224462bb6ac3015dabc427a4f98316),
                     },
                 ),
             ],
@@ -1203,8 +1208,8 @@ Done";
                         "refs/remotes/origin/b",
                     ),
                     Diff {
-                        before: Sha1(d4d535f1d5795c6027f2872b24b7268ece294209),
-                        after: Sha1(baad96fead6cdc20d47c55a4069c82952f9ac62c),
+                        before: ObjectId(d4d535f1d5795c6027f2872b24b7268ece294209),
+                        after: ObjectId(baad96fead6cdc20d47c55a4069c82952f9ac62c),
                     },
                 ),
             ],

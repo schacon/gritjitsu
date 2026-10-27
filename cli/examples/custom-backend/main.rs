@@ -105,7 +105,11 @@ struct JitBackend {
 
 impl JitBackend {
     fn init(settings: &UserSettings, store_path: &Path) -> Result<Self, BackendInitError> {
-        let inner = GitBackend::init_internal(settings, store_path, gix::hash::Kind::default())?;
+        let inner = GitBackend::init_internal(
+            settings,
+            store_path,
+            grit_lib::objects::HashAlgo::default(),
+        )?;
         Ok(Self { inner })
     }
 

@@ -311,17 +311,20 @@ fn set_git_repo_bare(path: &std::path::Path, bare: bool) -> Result<(), CommandEr
     let bare_str = if bare { "true" } else { "false" };
     let config_path = path.join("config");
     let mut config_file =
-        gix::config::File::from_path_no_includes(config_path.clone(), gix::config::Source::Local)
+        grit_lib::config::ConfigFile::from_path(&config_path, grit_lib::config::ConfigScope::Local)
+            .and_then(|config| {
+                config.ok_or_else(|| {
+                    grit_lib::error::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+                })
+            })
             .map_err(|err| user_error_with_message("Failed to open Git config file.", err))?;
 
-    config_file
-        .set_raw_value("core.bare", bare_str)
-        .map_err(|err| {
-            user_error_with_message(
-                format!("Failed to set core.bare to {bare_str} in Git config."),
-                err,
-            )
-        })?;
+    config_file.set("core.bare", bare_str).map_err(|err| {
+        user_error_with_message(
+            format!("Failed to set core.bare to {bare_str} in Git config."),
+            err,
+        )
+    })?;
 
     git::save_git_config(&config_file).map_err(|err| {
         user_error_with_message(

@@ -28,7 +28,6 @@ use std::sync::Barrier;
 use std::sync::mpsc;
 use std::thread;
 
-use gix::remote::Direction;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendError;
 use jj_lib::backend::ChangeId;
@@ -139,11 +138,11 @@ impl GitSubprocessCallback for NullCallback {
 }
 
 fn empty_git_commit(
-    git_repo: &gix::Repository,
+    git_repo: &testutils::git::Repository,
     ref_name: &str,
-    parents: &[gix::ObjectId],
-) -> gix::ObjectId {
-    let empty_tree_id = git_repo.empty_tree().id().detach();
+    parents: &[testutils::git::ObjectId],
+) -> testutils::git::ObjectId {
+    let empty_tree_id = git_repo.empty_tree().id();
     testutils::git::write_commit(
         git_repo,
         ref_name,
@@ -153,12 +152,12 @@ fn empty_git_commit(
     )
 }
 
-fn jj_id(id: gix::ObjectId) -> CommitId {
+fn jj_id(id: testutils::git::ObjectId) -> CommitId {
     CommitId::from_bytes(id.as_bytes())
 }
 
-fn git_id(commit: &Commit) -> gix::ObjectId {
-    gix::ObjectId::from_bytes_or_panic(commit.id().as_bytes())
+fn git_id(commit: &Commit) -> testutils::git::ObjectId {
+    testutils::git::ObjectId::from_bytes(commit.id().as_bytes()).unwrap()
 }
 
 fn git_oid(commit: &Commit) -> grit_lib::objects::ObjectId {
@@ -180,8 +179,8 @@ fn get_git_backend(repo: &Arc<ReadonlyRepo>) -> &GitBackend {
     repo.store().backend_impl().unwrap()
 }
 
-fn get_git_repo(repo: &Arc<ReadonlyRepo>) -> gix::Repository {
-    get_git_backend(repo).git_repo()
+fn get_git_repo(repo: &Arc<ReadonlyRepo>) -> testutils::git::Repository {
+    get_git_backend(repo).reopen_git_repo().unwrap().into()
 }
 
 fn init_external_git_repo(test_repo: &TestRepo, name: &Path) -> TestResult<Arc<ReadonlyRepo>> {
@@ -449,11 +448,11 @@ fn test_import_refs_reimport() -> TestResult {
     let commit2 = empty_git_commit(&git_repo, "refs/heads/main", &[commit1]);
     let commit3 = empty_git_commit(&git_repo, "refs/heads/feature1", &[commit2]);
     let commit4 = empty_git_commit(&git_repo, "refs/heads/feature2", &[commit2]);
-    let pgp_key_oid = git_repo.write_blob(b"my PGP key")?.detach();
+    let pgp_key_oid = git_repo.write_blob(b"my PGP key")?;
     git_repo.reference(
         "refs/tags/my-gpg-key",
         pgp_key_oid,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
 
@@ -662,7 +661,7 @@ fn test_import_refs_reimport_git_head_with_moved_ref() -> TestResult {
     git_repo.reference(
         "refs/heads/main",
         git_id(&commit1),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     testutils::git::set_head_to_id(&git_repo, git_id(&commit1));
@@ -678,7 +677,7 @@ fn test_import_refs_reimport_git_head_with_moved_ref() -> TestResult {
     git_repo.reference(
         "refs/heads/main",
         git_id(&commit2),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     testutils::git::set_head_to_id(&git_repo, git_id(&commit2));
@@ -1203,7 +1202,7 @@ fn test_import_refs_reimport_absent_tracked_remote_bookmarks() -> TestResult {
     git_repo.reference(
         "refs/remotes/origin/foo",
         git_id(&commit2),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     let mut tx = repo.start_transaction();
@@ -1276,7 +1275,7 @@ fn test_import_refs_reimport_absent_tracked_remote_tags() -> TestResult {
     git_repo.reference(
         "refs/tags/foo",
         git_id(&commit3),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     let mut tx = repo.start_transaction();
@@ -1371,7 +1370,7 @@ fn test_import_refs_reimport_git_head_with_fixed_ref() -> TestResult {
     git_repo.reference(
         "refs/heads/main",
         git_id(&commit1),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     testutils::git::set_head_to_id(&git_repo, git_id(&commit1));
@@ -2405,20 +2404,20 @@ fn test_import_some_refs() -> TestResult {
     Ok(())
 }
 
-fn git_ref(git_repo: &gix::Repository, name: &str, target: gix::ObjectId) {
+fn git_ref(git_repo: &testutils::git::Repository, name: &str, target: testutils::git::ObjectId) {
     git_repo
-        .reference(name, target, gix::refs::transaction::PreviousValue::Any, "")
+        .reference(name, target, testutils::git::PreviousValue::Any, "")
         .unwrap();
 }
 
-fn delete_git_ref(git_repo: &gix::Repository, name: &str) {
+fn delete_git_ref(git_repo: &testutils::git::Repository, name: &str) {
     git_repo.find_reference(name).unwrap().delete().unwrap();
 }
 
 struct GitRepoData {
     _temp_dir: TempDir,
-    origin_repo: gix::Repository,
-    git_repo: gix::Repository,
+    origin_repo: testutils::git::Repository,
+    git_repo: testutils::git::Repository,
     repo: Arc<ReadonlyRepo>,
 }
 
@@ -2526,7 +2525,7 @@ fn test_import_refs_missing_git_commit() -> TestResult {
     git_repo.reference(
         "refs/heads/main",
         commit1,
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/unborn");
@@ -2605,7 +2604,9 @@ fn test_import_export_head_bare_and_worktree() -> TestResult {
         None,
     )
     .block_on()?;
-    let work_git_repo = get_git_backend(&repo).open_git_repo_at_workdir(&workspace_root)?;
+    let work_git_repo: testutils::git::Repository = get_git_backend(&repo)
+        .open_git_repo_at_workdir(&workspace_root)?
+        .into();
 
     // Git HEAD shouldn't be imported yet
     assert_eq!(
@@ -2677,7 +2678,7 @@ fn test_export_refs_bookmark_changed() -> TestResult {
     git_repo.reference(
         "refs/heads/feature",
         commit,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "test",
     )?;
     testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/feature");
@@ -2727,11 +2728,11 @@ fn test_export_refs_tag_changed() -> TestResult {
     let git_repo = test_data.git_repo;
 
     let commit = empty_git_commit(&git_repo, "refs/tags/lightweight-change", &[]);
-    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let constraint = testutils::git::PreviousValue::MustNotExist;
     git_repo.tag_reference("lightweight-delete", commit, constraint)?;
     for name in ["annotated-change", "annotated-delete"] {
-        let kind = gix::object::Kind::Commit;
-        let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+        let kind = testutils::git::ObjectKind::Commit;
+        let constraint = testutils::git::PreviousValue::MustNotExist;
         git_repo.tag(name, commit, kind, None, "", constraint)?;
     }
 
@@ -2841,8 +2842,7 @@ fn test_export_refs_current_bookmark_changed() -> TestResult {
         git_repo
             .find_reference("refs/heads/main")?
             .peel_to_commit()?
-            .id()
-            .detach(),
+            .id(),
         git_id(&new_commit)
     );
     assert!(git_repo.head()?.is_detached(), "HEAD is detached");
@@ -2865,7 +2865,7 @@ fn test_export_refs_worktree_head_changed() -> TestResult {
     git_repo_wt.reference(
         "refs/heads/wt-branch",
         commit1,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
     testutils::git::set_symbolic_reference(&git_repo_wt, "HEAD", "refs/heads/wt-branch");
@@ -2908,7 +2908,7 @@ fn test_export_refs_worktree_no_detach() -> TestResult {
     git_repo_wt.reference(
         "refs/heads/wt-branch",
         commit1,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
     testutils::git::set_symbolic_reference(&git_repo_wt, "HEAD", "refs/heads/wt-branch");
@@ -2971,8 +2971,7 @@ fn test_export_refs_current_tag_changed() -> TestResult {
         git_repo
             .find_reference("refs/tags/v1.0")?
             .peel_to_commit()?
-            .id()
-            .detach(),
+            .id(),
         git_id(&new_commit)
     );
     assert!(git_repo.head()?.is_detached());
@@ -3004,7 +3003,7 @@ fn test_export_refs_unborn_git_bookmark(move_placeholder_ref: bool) -> TestResul
         git_repo.reference(
             "refs/jj/root",
             git_id(&new_commit),
-            gix::refs::transaction::PreviousValue::MustNotExist,
+            testutils::git::PreviousValue::MustNotExist,
             "",
         )?;
     }
@@ -3047,7 +3046,7 @@ fn test_export_import_sequence() -> TestResult {
     git_repo.reference(
         "refs/heads/main",
         git_id(&commit_a),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     git::import_refs(mut_repo, &import_options).block_on()?;
@@ -3072,7 +3071,7 @@ fn test_export_import_sequence() -> TestResult {
     git_repo.reference(
         "refs/heads/main",
         git_id(&commit_c),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
 
@@ -3608,7 +3607,7 @@ fn test_export_reexport_transitions() -> TestResult {
         git_repo.reference(
             format!("refs/heads/{bookmark}"),
             git_id(&commit_a),
-            gix::refs::transaction::PreviousValue::Any,
+            testutils::git::PreviousValue::Any,
             "",
         )?;
     }
@@ -3616,7 +3615,7 @@ fn test_export_reexport_transitions() -> TestResult {
         git_repo.reference(
             format!("refs/heads/{bookmark}"),
             git_id(&commit_b),
-            gix::refs::transaction::PreviousValue::Any,
+            testutils::git::PreviousValue::Any,
             "",
         )?;
     }
@@ -3624,7 +3623,7 @@ fn test_export_reexport_transitions() -> TestResult {
     git_repo.reference(
         format!("refs/heads/{bookmark}"),
         git_id(&commit_c),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "",
     )?;
 
@@ -3799,7 +3798,7 @@ fn test_reset_head_to_root() -> TestResult {
     git_repo.reference(
         "refs/jj/root",
         git_id(&commit1),
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
     reset_head(tx.repo_mut(), &test_workspace.workspace, &commit2)?;
@@ -3886,17 +3885,17 @@ fn test_reset_head_detached_out_of_sync() -> TestResult {
 }
 
 fn get_index_state(workspace_root: &Path) -> String {
-    let git_repo = gix::open(workspace_root).unwrap();
-    let index = git_repo.index().unwrap();
+    let git_repo = testutils::git::open(workspace_root);
+    let index = git_repo.index_handle().load().unwrap();
     index
         .entries()
         .iter()
         .map(|entry| {
             format!(
-                "{:?} {} {:?}\n",
-                entry.flags.stage(),
-                entry.path_in(index.path_backing()),
-                entry.mode
+                "{} {} {}\n",
+                testutils::git::index_stage_name(entry.stage()),
+                str::from_utf8(&entry.path).unwrap(),
+                testutils::git::index_mode_name(entry.mode),
             )
         })
         .join("")
@@ -3977,8 +3976,8 @@ fn test_reset_head_with_index_no_conflict() -> TestResult {
     // Git index should contain all files from the tree.
     // `Mode(DIR | SYMLINK)` actually means `MODE(COMMIT)`, as in a git submodule.
     insta::assert_snapshot!(get_index_state(workspace_root), @"
-    Unconflicted some/dir/commit Mode(DIR | SYMLINK)
-    Unconflicted some/dir/executable-file Mode(FILE | FILE_EXECUTABLE)
+    Unconflicted some/dir/commit Mode(COMMIT)
+    Unconflicted some/dir/executable-file Mode(FILE_EXECUTABLE)
     Unconflicted some/dir/normal-file Mode(FILE)
     Unconflicted some/dir/symlink Mode(SYMLINK)
     ");
@@ -4066,12 +4065,12 @@ fn test_reset_head_with_index_merge_conflict() -> TestResult {
     // Index should contain conflicted files from merge of parent commits.
     // `Mode(DIR | SYMLINK)` actually means `MODE(COMMIT)`, as in a git submodule.
     insta::assert_snapshot!(get_index_state(workspace_root), @"
-    Base some/dir/commit Mode(DIR | SYMLINK)
-    Ours some/dir/commit Mode(DIR | SYMLINK)
-    Theirs some/dir/commit Mode(DIR | SYMLINK)
-    Base some/dir/executable-file Mode(FILE | FILE_EXECUTABLE)
-    Ours some/dir/executable-file Mode(FILE | FILE_EXECUTABLE)
-    Theirs some/dir/executable-file Mode(FILE | FILE_EXECUTABLE)
+    Base some/dir/commit Mode(COMMIT)
+    Ours some/dir/commit Mode(COMMIT)
+    Theirs some/dir/commit Mode(COMMIT)
+    Base some/dir/executable-file Mode(FILE_EXECUTABLE)
+    Ours some/dir/executable-file Mode(FILE_EXECUTABLE)
+    Theirs some/dir/executable-file Mode(FILE_EXECUTABLE)
     Base some/dir/normal-file Mode(FILE)
     Ours some/dir/normal-file Mode(FILE)
     Theirs some/dir/normal-file Mode(FILE)
@@ -4151,9 +4150,10 @@ fn run_git_allow_failure(dir: &Path, args: &[&str]) -> (String, bool) {
 /// Whether `.git/index` currently carries a cache-tree (TREE) extension.
 fn index_has_cache_tree(workspace_root: &Path) -> bool {
     testutils::git::open(workspace_root)
-        .index()
+        .index_handle()
+        .load()
         .unwrap()
-        .tree()
+        .cache_tree
         .is_some()
 }
 
@@ -4369,7 +4369,7 @@ fn test_fetch_initial_commit_head_is_set() -> TestResult {
     test_data.origin_repo.reference(
         "refs/tags/v1.0",
         new_git_commit,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
 
@@ -4407,7 +4407,7 @@ fn test_fetch_success() -> TestResult {
     test_data.origin_repo.reference(
         "refs/tags/v1.0",
         new_git_commit,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
 
@@ -4590,19 +4590,10 @@ fn test_fetch_environment_options() -> TestResult {
 fn test_load_default_fetch_bookmarks() -> TestResult {
     let mut test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
     let git_repo = get_git_repo(&test_repo.repo);
-    let config = git_repo.config_snapshot().clone();
-
-    // NB: gix doesn't seem to round-trip some of these refspecs even though
-    // they parse fine, so we'll update the config file here directly
+    // Update the config file directly to write the refspecs as is.
     std::fs::OpenOptions::new()
         .append(true)
-        .open(
-            config
-                .meta()
-                .path
-                .as_ref()
-                .expect("failed to find config file"),
-        )
+        .open(testutils::git::config_path(&git_repo))
         .expect("failed to open config file")
         .write_all(
             br#"
@@ -4710,19 +4701,11 @@ fn test_load_default_fetch_bookmarks() -> TestResult {
 fn test_load_default_fetch_bookmarks_invalid_configuration() -> TestResult {
     let mut test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
     let git_repo = get_git_repo(&test_repo.repo);
-    let config = git_repo.config_snapshot().clone();
-
-    // These refspecs are already rejected by gix, but we want to assert the error
-    // reporting here
+    // These refspecs are invalid, but we want to assert the error reporting
+    // here
     std::fs::OpenOptions::new()
         .append(true)
-        .open(
-            config
-                .meta()
-                .path
-                .as_ref()
-                .expect("failed to find config file"),
-        )
+        .open(testutils::git::config_path(&git_repo))
         .expect("failed to open config file")
         .write_all(
             br#"
@@ -4754,31 +4737,19 @@ fn test_load_default_fetch_bookmarks_invalid_configuration() -> TestResult {
         RemoteNameBuf(
             "first",
         ),
-        fetch ref-spec under `remote.first` was invalid, input="first"
-        
-        Caused by:
-            0: Could not parse refspec, input="+refs/heads/bad*pattern*:refs/remotes/heads/bad*pattern*", key="remote.<name>.fetch"
-            1: refspec patterns may only contain a single '*' character, input="refs/heads/bad*pattern*",
+        "Invalid fetch refspec: +refs/heads/bad*pattern*:refs/remotes/heads/bad*pattern*: refspec patterns may only contain a single '*' character",
     )
     InvalidRemoteConfiguration(
         RemoteNameBuf(
             "second",
         ),
-        fetch ref-spec under `remote.second` was invalid, input="second"
-        
-        Caused by:
-            0: Could not parse refspec, input="+refs/heads/badpattern?:refs/remotes/heads/badpattern?", key="remote.<name>.fetch"
-            1: Reference name contains invalid byte: "?",
+        "Invalid fetch refspec: +refs/heads/badpattern?:refs/remotes/heads/badpattern?: ref name contains an illegal character",
     )
     InvalidRemoteConfiguration(
         RemoteNameBuf(
             "third",
         ),
-        fetch ref-spec under `remote.third` was invalid, input="third"
-        
-        Caused by:
-            0: Could not parse refspec, input="+refs/heads/bad[pat]:refs/remotes/heads/bad[pat]", key="remote.<name>.fetch"
-            1: Reference name contains invalid byte: "[",
+        "Invalid fetch refspec: +refs/heads/bad[pat]:refs/remotes/heads/bad[pat]: ref name contains an illegal character",
     )
     "#);
     Ok(())
@@ -5214,8 +5185,8 @@ fn test_fetch_export_annotated_tags() -> TestResult {
     let commit1 = empty_git_commit(&test_data.origin_repo, "refs/tags/tag1", &[]);
     let commit2 = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
     let commit3 = empty_git_commit(&test_data.origin_repo, "refs/tags/tag3.4", &[]);
-    let kind = gix::object::Kind::Commit;
-    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let kind = testutils::git::ObjectKind::Commit;
+    let constraint = testutils::git::PreviousValue::MustNotExist;
     let tag2_oid = test_data
         .origin_repo
         .tag("tag2", commit2, kind, None, "", constraint)?
@@ -5301,17 +5272,14 @@ fn test_fetch_export_annotated_tags() -> TestResult {
 fn test_fetch_ignores_configured_refspecs() -> TestResult {
     let test_data = GitRepoData::create();
 
-    let mut remote = test_data.git_repo.find_remote("origin")?;
-    remote.replace_refspecs(
-        [
+    testutils::git::set_config_values(
+        &test_data.git_repo,
+        "remote.origin.fetch",
+        &[
             "+refs/heads/*:refs/unusual/bookmarks/*",
             "+refs/tags/*:refs/unusual/tags/*",
         ],
-        gix::remote::Direction::Fetch,
-    )?;
-    let mut config = test_data.git_repo.config_snapshot().clone();
-    remote.save_as_to("origin", &mut config)?;
-    git::save_git_config(&config)?;
+    );
 
     empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
     empty_git_commit(&test_data.origin_repo, "refs/tags/v1", &[]);
@@ -5842,15 +5810,13 @@ fn test_push_bookmarks_unmapped_refs() -> TestResult {
     // Add remote with refspecs that map only specific branch
     let repo = &test_repo.repo;
     let git_repo = get_git_repo(repo);
-    let mut remote = git_repo
-        .remote_at(remote_git_repo.path().to_str().unwrap())?
-        .with_refspecs(
-            ["+refs/heads/dummy:refs/remotes/origin/dummy"],
-            gix::remote::Direction::Fetch,
-        )?;
-    let mut config = git_repo.config_snapshot().clone();
-    remote.save_as_to("origin", &mut config).unwrap();
-    git::save_git_config(&config)?;
+    let remote_url = remote_git_repo.path().to_str().unwrap();
+    testutils::git::set_config_values(&git_repo, "remote.origin.url", &[remote_url]);
+    testutils::git::set_config_values(
+        &git_repo,
+        "remote.origin.fetch",
+        &["+refs/heads/dummy:refs/remotes/origin/dummy"],
+    );
     // Reload after Git configuration change.
     let repo = test_repo
         .env
@@ -5865,7 +5831,7 @@ fn test_push_bookmarks_unmapped_refs() -> TestResult {
     git_repo.reference(
         "refs/remotes/origin/bookmark2",
         git_id(&commit2a),
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "",
     )?;
     let targets = GitPushRefTargets {
@@ -5969,15 +5935,13 @@ fn test_push_bookmarks_unexported_refs() -> TestResult {
     // Add remote with refspecs that map only specific branch
     let repo = &test_repo.repo;
     let git_repo = get_git_repo(repo);
-    let mut remote = git_repo
-        .remote_at(remote_git_repo.path().to_str().unwrap())?
-        .with_refspecs(
-            ["+refs/heads/dummy:refs/remotes/origin/dummy"],
-            gix::remote::Direction::Fetch,
-        )?;
-    let mut config = git_repo.config_snapshot().clone();
-    remote.save_as_to("origin", &mut config).unwrap();
-    git::save_git_config(&config)?;
+    let remote_url = remote_git_repo.path().to_str().unwrap();
+    testutils::git::set_config_values(&git_repo, "remote.origin.url", &[remote_url]);
+    testutils::git::set_config_values(
+        &git_repo,
+        "remote.origin.fetch",
+        &["+refs/heads/dummy:refs/remotes/origin/dummy"],
+    );
     // Reload after Git configuration change
     let repo = test_repo
         .env
@@ -6083,12 +6047,11 @@ fn test_push_new_tags() -> TestResult {
 
     // Create lightweight and annotated tags pointing to the same commit.
     let commit1_oid = empty_git_commit(&git_repo, "refs/tags/lightweight", &[]);
-    let kind = gix::object::Kind::Commit;
-    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let kind = testutils::git::ObjectKind::Commit;
+    let constraint = testutils::git::PreviousValue::MustNotExist;
     let annotated_tag1_oid = git_repo
         .tag("annotated", commit1_oid, kind, None, "", constraint)?
-        .id()
-        .detach();
+        .id();
     let mut tx = test_data.repo.start_transaction();
     git::import_refs(tx.repo_mut(), &import_options).block_on()?;
 
@@ -6155,8 +6118,8 @@ fn test_push_deleted_tags() -> TestResult {
 
     // Create lightweight and annotated tags remotely.
     let commit1_oid = empty_git_commit(&origin_repo, "refs/tags/lightweight", &[]);
-    let kind = gix::object::Kind::Commit;
-    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let kind = testutils::git::ObjectKind::Commit;
+    let constraint = testutils::git::PreviousValue::MustNotExist;
     origin_repo.tag("annotated", commit1_oid, kind, None, "", constraint)?;
 
     // Fetch and delete local tags.
@@ -6244,8 +6207,8 @@ fn test_push_moved_tags_without_fetching() -> TestResult {
 
     // Create lightweight and annotated tags pointing to the same commit.
     let commit1_oid = empty_git_commit(&git_repo, "refs/tags/lightweight", &[]);
-    let kind = gix::object::Kind::Commit;
-    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let kind = testutils::git::ObjectKind::Commit;
+    let constraint = testutils::git::PreviousValue::MustNotExist;
     git_repo.tag("annotated", commit1_oid, kind, None, "", constraint)?;
     let mut tx = test_data.repo.start_transaction();
     git::import_refs(tx.repo_mut(), &import_options).block_on()?;
@@ -6272,12 +6235,11 @@ fn test_push_moved_tags_without_fetching() -> TestResult {
 
     // Move pushed tags
     let commit2_oid = empty_git_commit(&git_repo, "refs/tags/lightweight", &[commit1_oid]);
-    let kind = gix::object::Kind::Commit;
-    let constraint = gix::refs::transaction::PreviousValue::MustExist;
+    let kind = testutils::git::ObjectKind::Commit;
+    let constraint = testutils::git::PreviousValue::MustExist;
     let annotated_tag2_oid = git_repo
         .tag("annotated", commit2_oid, kind, None, "", constraint)?
-        .id()
-        .detach();
+        .id();
     git::import_refs(tx.repo_mut(), &import_options).block_on()?;
 
     // Push moved tags
@@ -6345,8 +6307,8 @@ fn test_push_deleted_tags_without_fetching() -> TestResult {
 
     // Create lightweight and annotated tags pointing to the same commit.
     let commit1_oid = empty_git_commit(&git_repo, "refs/tags/lightweight", &[]);
-    let kind = gix::object::Kind::Commit;
-    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let kind = testutils::git::ObjectKind::Commit;
+    let constraint = testutils::git::PreviousValue::MustNotExist;
     git_repo.tag("annotated", commit1_oid, kind, None, "", constraint)?;
     let mut tx = test_data.repo.start_transaction();
     git::import_refs(tx.repo_mut(), &import_options).block_on()?;
@@ -7109,13 +7071,13 @@ fn test_shallow_commits_lack_parents() -> TestResult {
     testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/main");
 
     let make_shallow = |repo, mut shallow_commits: Vec<_>| {
-        let shallow_file = get_git_backend(repo).git_repo().shallow_file();
+        let shallow_file = get_git_backend(repo).git_repo().git_dir().join("shallow");
         shallow_commits.sort();
         let mut buf = Vec::<u8>::new();
         for commit in shallow_commits {
             writeln!(buf, "{commit}").unwrap();
         }
-        fs::write(shallow_file.unwrap(), buf).unwrap();
+        fs::write(shallow_file, buf).unwrap();
         // Reload the repo to invalidate mtime-based in-memory cache
         test_env.load_repo_at_head(&settings, test_repo.repo_path())
     };
@@ -7490,19 +7452,13 @@ fn assert_fetch_and_push_urls(
     expected_push_url: Option<&str>,
 ) {
     let git_repo = get_git_repo(repo);
-    let remote = git_repo
-        .find_remote(remote_name)
+    let remote = git::try_find_active_remote(&git_repo, remote_name.as_ref())
+        .unwrap()
         .expect("unable to find remote");
-    let actual_fetch_url = remote.url(Direction::Fetch);
-    let actual_push_url = remote.url(Direction::Push);
-
-    let expected_fetch_url = expected_fetch_url
-        .map(|u| gix::Url::try_from(u).expect("failed to parse the expected fetch url"));
-    let expected_push_url = expected_push_url
-        .map(|u| gix::Url::try_from(u).expect("failed to parse the expected push url"));
-
-    assert_eq!(actual_fetch_url, expected_fetch_url.as_ref());
-    assert_eq!(actual_push_url, expected_push_url.as_ref());
+    let actual_fetch_url = remote.fetch_url();
+    let actual_push_url = remote.push_url();
+    assert_eq!(actual_fetch_url, expected_fetch_url);
+    assert_eq!(actual_push_url, expected_push_url);
 }
 
 #[test]

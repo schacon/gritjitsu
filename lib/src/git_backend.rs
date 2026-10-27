@@ -31,7 +31,6 @@ use std::process::ExitStatus;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -116,11 +115,9 @@ pub const CHANGE_ID_COMMIT_HEADER: &str = "change-id";
 #[derive(Debug, Error)]
 pub enum GitBackendInitError {
     #[error("Failed to initialize git repository")]
-    InitRepository(#[source] gix::Error),
+    InitRepository(#[source] grit_lib::error::Error),
     #[error("Failed to open git repository")]
-    OpenRepository(#[source] gix::Error),
-    #[error("Failed to open git repository")]
-    OpenGritRepository(#[source] grit_lib::error::Error),
+    OpenRepository(#[source] grit_lib::error::Error),
     #[error("Failed to encode git repository path")]
     EncodeRepositoryPath(#[source] BadPathEncoding),
     #[error(transparent)]
@@ -138,9 +135,7 @@ impl From<Box<GitBackendInitError>> for BackendInitError {
 #[derive(Debug, Error)]
 pub enum GitBackendLoadError {
     #[error("Failed to open git repository")]
-    OpenRepository(#[source] gix::Error),
-    #[error("Failed to open git repository")]
-    OpenGritRepository(#[source] grit_lib::error::Error),
+    OpenRepository(#[source] grit_lib::error::Error),
     #[error("Failed to decode git repository path")]
     DecodeRepositoryPath(#[source] BadPathEncoding),
     #[error(transparent)]
@@ -192,13 +187,10 @@ pub enum GitGcError {
 }
 
 pub struct GitBackend {
-    // While gix::Repository can be created from gix::ThreadSafeRepository, it's
-    // cheaper to cache the thread-local instance behind a mutex than creating
-    // one for each backend method call. Our GitBackend is most likely to be
-    // used in a single-threaded context.
-    base_repo: gix::ThreadSafeRepository,
-    repo: Mutex<gix::Repository>,
-    grit_repo: grit_lib::repo::Repository,
+    repo: grit_lib::repo::Repository,
+    /// Path to the `.git` directory or the repository itself if it's bare,
+    /// canonicalized except for a last `.git` component.
+    git_repo_path: PathBuf,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -215,21 +207,19 @@ impl GitBackend {
     pub const NAME: &str = "git";
 
     fn new(
-        base_repo: gix::ThreadSafeRepository,
-        grit_repo: grit_lib::repo::Repository,
+        repo: grit_lib::repo::Repository,
+        git_repo_path: PathBuf,
         extra_metadata_store: TableStore,
         git_settings: GitSettings,
         reflog_identity: String,
     ) -> Self {
-        let repo = base_repo.to_thread_local();
-        let hash_algo = grit_repo.odb().hash_algo();
+        let hash_algo = repo.odb().hash_algo();
         let root_commit_id = CommitId::from_bytes(GritObjectId::null(hash_algo).as_bytes());
         let root_change_id = ChangeId::from_bytes(&[0; CHANGE_ID_LENGTH]);
         let empty_tree_id = TreeId::from_bytes(empty_tree_oid(hash_algo).as_bytes());
         Self {
-            base_repo,
-            repo: Mutex::new(repo),
-            grit_repo,
+            repo,
+            git_repo_path,
             root_commit_id,
             root_change_id,
             empty_tree_id,
@@ -245,28 +235,18 @@ impl GitBackend {
     pub fn init_internal(
         settings: &UserSettings,
         store_path: &Path,
-        object_hash: gix::hash::Kind,
+        hash_algo: HashAlgo,
     ) -> Result<Self, Box<GitBackendInitError>> {
         let git_repo_path = Path::new("git");
-        let git_repo = gix::ThreadSafeRepository::init_opts(
-            store_path.join(git_repo_path),
-            gix::create::Kind::Bare,
-            gix::create::Options {
-                object_hash: Some(object_hash),
-                ..Default::default()
-            },
-            gix_open_opts_from_settings(settings),
-        )
-        .map_err(GitBackendInitError::InitRepository)?;
-        let git_settings =
-            GitSettings::from_settings(settings).map_err(GitBackendInitError::Config)?;
-        Self::init_with_repo(
-            store_path,
-            git_repo_path,
-            git_repo,
-            git_settings,
-            reflog_identity(settings),
-        )
+        let options = grit_lib::repo::InitOptions::new()
+            .with_bare(true)
+            .with_object_format(hash_algo)
+            .with_environment(grit_environment());
+        let git_dir = store_path.join(git_repo_path);
+        grit_lib::repo::Repository::init(&git_dir, &options)
+            .map_err(GitBackendInitError::InitRepository)?;
+        create_template_layout(&git_dir)?;
+        Self::init_with_repo(settings, store_path, git_repo_path)
     }
 
     /// Initializes backend by creating a new Git repo at the specified
@@ -275,7 +255,7 @@ impl GitBackend {
         settings: &UserSettings,
         store_path: &Path,
         workspace_root: &Path,
-        object_hash: gix::hash::Kind,
+        hash_algo: HashAlgo,
     ) -> Result<Self, Box<GitBackendInitError>> {
         let canonical_workspace_root = {
             let path = store_path.join(workspace_root);
@@ -283,30 +263,26 @@ impl GitBackend {
                 .context(&path)
                 .map_err(GitBackendInitError::Path)?
         };
-        let git_repo = gix::ThreadSafeRepository::init_opts(
-            canonical_workspace_root,
-            gix::create::Kind::WithWorktree,
-            gix::create::Options {
-                object_hash: Some(object_hash),
-                ..Default::default()
-            },
-            gix_open_opts_from_settings(settings),
-        )
-        .map_err(GitBackendInitError::InitRepository)?;
+        let options = grit_lib::repo::InitOptions::new()
+            .with_object_format(hash_algo)
+            .with_environment(grit_environment());
+        grit_lib::repo::Repository::init(&canonical_workspace_root, &options)
+            .map_err(GitBackendInitError::InitRepository)?;
+        create_template_layout(&canonical_workspace_root.join(".git"))?;
         let git_repo_path = workspace_root.join(".git");
-        let git_settings =
-            GitSettings::from_settings(settings).map_err(GitBackendInitError::Config)?;
-        Self::init_with_repo(
-            store_path,
-            &git_repo_path,
-            git_repo,
-            git_settings,
-            reflog_identity(settings),
-        )
+        Self::init_with_repo(settings, store_path, &git_repo_path)
     }
 
     /// Initializes backend with an existing Git repo at the specified path.
     pub fn init_external(
+        settings: &UserSettings,
+        store_path: &Path,
+        git_repo_path: &Path,
+    ) -> Result<Self, Box<GitBackendInitError>> {
+        Self::init_with_repo(settings, store_path, git_repo_path)
+    }
+
+    fn init_with_repo(
         settings: &UserSettings,
         store_path: &Path,
         git_repo_path: &Path,
@@ -317,29 +293,10 @@ impl GitBackend {
                 .context(&path)
                 .map_err(GitBackendInitError::Path)?
         };
-        let git_repo = gix::ThreadSafeRepository::open_opts(
-            canonical_git_repo_path,
-            gix_open_opts_from_settings(settings),
-        )
-        .map_err(GitBackendInitError::OpenRepository)?;
+        let repo = open_grit_repo(&canonical_git_repo_path)
+            .map_err(GitBackendInitError::OpenRepository)?;
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendInitError::Config)?;
-        Self::init_with_repo(
-            store_path,
-            git_repo_path,
-            git_repo,
-            git_settings,
-            reflog_identity(settings),
-        )
-    }
-
-    fn init_with_repo(
-        store_path: &Path,
-        git_repo_path: &Path,
-        repo: gix::ThreadSafeRepository,
-        git_settings: GitSettings,
-        reflog_identity: String,
-    ) -> Result<Self, Box<GitBackendInitError>> {
         let extra_path = store_path.join("extra");
         fs::create_dir(&extra_path)
             .context(&extra_path)
@@ -361,15 +318,13 @@ impl GitBackend {
         fs::write(&target_path, git_repo_path_bytes)
             .context(&target_path)
             .map_err(GitBackendInitError::Path)?;
-        let grit_repo =
-            open_grit_repo(repo.path()).map_err(GitBackendInitError::OpenGritRepository)?;
-        let extra_metadata_store = TableStore::init(extra_path, grit_repo.odb().hash_algo().len());
+        let extra_metadata_store = TableStore::init(extra_path, repo.odb().hash_algo().len());
         Ok(Self::new(
             repo,
-            grit_repo,
+            canonical_git_repo_path,
             extra_metadata_store,
             git_settings,
-            reflog_identity,
+            reflog_identity(settings),
         ))
     }
 
@@ -389,46 +344,33 @@ impl GitBackend {
                 .context(&git_repo_path)
                 .map_err(GitBackendLoadError::Path)?
         };
-        let repo = gix::ThreadSafeRepository::open_opts(
-            git_repo_path,
-            gix_open_opts_from_settings(settings),
-        )
-        .map_err(GitBackendLoadError::OpenRepository)?;
-        let grit_repo =
-            open_grit_repo(repo.path()).map_err(GitBackendLoadError::OpenGritRepository)?;
+        let repo = open_grit_repo(&git_repo_path).map_err(GitBackendLoadError::OpenRepository)?;
         let extra_metadata_store =
-            TableStore::load(store_path.join("extra"), grit_repo.odb().hash_algo().len());
+            TableStore::load(store_path.join("extra"), repo.odb().hash_algo().len());
         let git_settings =
             GitSettings::from_settings(settings).map_err(GitBackendLoadError::Config)?;
         Ok(Self::new(
             repo,
-            grit_repo,
+            git_repo_path,
             extra_metadata_store,
             git_settings,
             reflog_identity(settings),
         ))
     }
 
-    fn lock_git_repo(&self) -> MutexGuard<'_, gix::Repository> {
-        self.repo.lock().unwrap()
-    }
-
-    /// Returns a new thread-local handle for the underlying Git repository.
+    /// Returns the handle for the underlying Git repository.
     ///
-    /// Use [`Self::open_git_repo_at_workdir()`] for worktree operations.
-    pub fn git_repo(&self) -> gix::Repository {
-        self.base_repo.to_thread_local()
+    /// Its configuration is read when the backend is loaded. Use
+    /// [`Self::reopen_git_repo()`] to see later changes, and
+    /// [`Self::open_git_repo_at_workdir()`] for worktree operations.
+    pub fn git_repo(&self) -> &grit_lib::repo::Repository {
+        &self.repo
     }
 
-    /// Returns the grit-lib handle for the underlying Git repository.
-    pub fn grit_repo(&self) -> &grit_lib::repo::Repository {
-        &self.grit_repo
-    }
-
-    /// Opens a new grit-lib handle for the underlying Git repository, picking
-    /// up configuration changes made since this backend was loaded.
-    pub fn reopen_grit_repo(&self) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
-        open_grit_repo(self.grit_repo.git_dir())
+    /// Opens a new handle for the underlying Git repository, picking up
+    /// configuration changes made since this backend was loaded.
+    pub fn reopen_git_repo(&self) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+        open_grit_repo(self.repo.git_dir())
     }
 
     /// `Name <email>` to record in reflog entries.
@@ -436,15 +378,15 @@ impl GitBackend {
         &self.reflog_identity
     }
 
-    /// Opens the repository at the given workspace path with grit-lib.
+    /// Opens the repository at the given workspace path.
     ///
     /// For a linked Git worktree, the returned repository's HEAD is the
     /// worktree's HEAD.
-    pub fn open_grit_repo_at_workdir(
+    pub fn open_git_repo_at_workdir(
         &self,
         path: &Path,
     ) -> Result<grit_lib::repo::Repository, GitRepoAtWorkdirError> {
-        let open_repo = &self.grit_repo;
+        let open_repo = &self.repo;
         if let Some(workdir) = open_repo.work_tree()
             && (workdir == path || dunce::canonicalize(path).is_ok_and(|path| workdir == path))
         {
@@ -452,20 +394,16 @@ impl GitBackend {
                 .map_err(|err| GitRepoAtWorkdirError::Other(err.into()));
         }
 
+        let to_open_err = |source: grit_lib::error::Error| match source {
+            grit_lib::error::Error::NotARepository(_) => GitRepoAtWorkdirError::NotFound {
+                path: path.to_owned(),
+                source: source.into(),
+            },
+            source => GitRepoAtWorkdirError::Other(source.into()),
+        };
         let dot_git = path.join(".git");
-        let git_dir = grit_lib::repo::resolve_dot_git(&dot_git).map_err(|source| {
-            if dot_git.exists() {
-                GitRepoAtWorkdirError::Other(source.into())
-            } else {
-                let path = path.to_owned();
-                GitRepoAtWorkdirError::NotFound {
-                    path,
-                    source: source.into(),
-                }
-            }
-        })?;
-        let work_repo = open_grit_repo_with_work_tree(&git_dir, Some(path))
-            .map_err(|err| GitRepoAtWorkdirError::Other(err.into()))?;
+        let git_dir = grit_lib::repo::resolve_dot_git(&dot_git).map_err(to_open_err)?;
+        let work_repo = open_grit_repo_with_work_tree(&git_dir, Some(path)).map_err(to_open_err)?;
         let canonicalize = |path: &Path| {
             dunce::canonicalize(path).map_err(|err| GitRepoAtWorkdirError::Other(err.into()))
         };
@@ -480,59 +418,16 @@ impl GitBackend {
         }
     }
 
-    /// Reopens the repository at the given workspace path. Returns a new
-    /// thread-local handle.
-    pub fn open_git_repo_at_workdir(
-        &self,
-        path: &Path,
-    ) -> Result<gix::Repository, GitRepoAtWorkdirError> {
-        // Try the open repository first.
-        let open_repo = self.git_repo();
-        if let Some(workdir) = open_repo.workdir()
-            && (workdir == path || dunce::canonicalize(path).is_ok_and(|path| workdir == path))
-        {
-            return Ok(open_repo);
-        }
-
-        // The input path doesn't include ".git".
-        let opts = open_repo.open_options().clone().open_path_as_is(false);
-        let work_repo = gix::ThreadSafeRepository::open_opts(path, opts)
-            .map_err(|source| {
-                if source.is_not_found() {
-                    let path = path.to_owned();
-                    GitRepoAtWorkdirError::NotFound {
-                        path,
-                        source: source.into(),
-                    }
-                } else {
-                    GitRepoAtWorkdirError::Other(source.into())
-                }
-            })?
-            .to_thread_local();
-        let canonicalize = |path: &Path| {
-            dunce::canonicalize(path).map_err(|err| GitRepoAtWorkdirError::Other(err.into()))
-        };
-        if open_repo.common_dir() == work_repo.common_dir()
-            || canonicalize(open_repo.common_dir())? == canonicalize(work_repo.common_dir())?
-        {
-            // The last (path, work_repo) can be cached if needed.
-            Ok(work_repo)
-        } else {
-            let path = path.to_owned();
-            Err(GitRepoAtWorkdirError::Unrelated { path })
-        }
-    }
-
     /// Path to the `.git` directory or the repository itself if it's bare.
     pub fn git_repo_path(&self) -> &Path {
-        self.base_repo.path()
+        &self.git_repo_path
     }
 
     fn shallow_root_ids(&self) -> BackendResult<&[CommitId]> {
         // It's expensive to stat the shallow file on every read_object() call.
         // Refreshing shallow roots is also bad for consistency reasons.
         self.shallow_root_ids
-            .get_or_try_init(|| read_shallow_root_ids(self.grit_repo.common_git_dir()))
+            .get_or_try_init(|| read_shallow_root_ids(self.repo.common_git_dir()))
             .map(AsRef::as_ref)
     }
 
@@ -594,7 +489,7 @@ impl GitBackend {
         // Create no-gc ref even if known to the extras table. Concurrent GC
         // process might have deleted the no-gc ref.
         edit_references(
-            &self.grit_repo,
+            &self.repo,
             head_ids.iter().copied().map(to_no_gc_ref_update),
         )?;
 
@@ -607,7 +502,7 @@ impl GitBackend {
         let (table, table_lock) = self.read_extra_metadata_table_locked()?;
         let mut mut_table = table.start_mutation();
         import_extra_metadata_entries_from_heads(
-            &self.grit_repo,
+            &self.repo,
             &mut mut_table,
             &table_lock,
             &head_ids,
@@ -617,19 +512,44 @@ impl GitBackend {
     }
 
     fn read_file_sync(&self, id: &FileId) -> BackendResult<Vec<u8>> {
-        read_object_of_kind(&self.grit_repo, id, ObjectKind::Blob)
+        read_object_of_kind(&self.repo, id, ObjectKind::Blob)
     }
 
     fn read_tree_id_for_commit(&self, id: &CommitId) -> BackendResult<GritObjectId> {
         let tree = self.read_commit(id).block_on()?.root_tree;
         // TODO(kfm): probably want to do something here if it is a merge
         let tree_id = tree.first();
-        validate_git_object_id(&self.grit_repo, tree_id)
+        validate_git_object_id(&self.repo, tree_id)
     }
 
     fn write_blob(&self, bytes: &[u8], object_type: &'static str) -> BackendResult<GritObjectId> {
-        write_object(&self.grit_repo, ObjectKind::Blob, bytes, object_type)
+        write_object(&self.repo, ObjectKind::Blob, bytes, object_type)
     }
+}
+
+/// Creates the `hooks` directory and `info/exclude` file Git's default
+/// template would have created in a new repository.
+fn create_template_layout(git_dir: &Path) -> Result<(), Box<GitBackendInitError>> {
+    let hooks_dir = git_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir)
+        .context(&hooks_dir)
+        .map_err(GitBackendInitError::Path)?;
+    let info_dir = git_dir.join("info");
+    fs::create_dir_all(&info_dir)
+        .context(&info_dir)
+        .map_err(GitBackendInitError::Path)?;
+    let exclude_path = info_dir.join("exclude");
+    if !exclude_path.exists() {
+        fs::write(
+            &exclude_path,
+            "# git ls-files --others --exclude-from=.git/info/exclude\n# Lines that start with \
+             '#' are comments.\n# For a project mostly in C, the following would be a good set \
+             of\n# exclude patterns (uncomment them if you want to use them):\n# *.[oa]\n# *~\n",
+        )
+        .context(&exclude_path)
+        .map_err(GitBackendInitError::Path)?;
+    }
+    Ok(())
 }
 
 /// Canonicalizes the given `path` except for the last `".git"` component.
@@ -647,36 +567,46 @@ pub fn canonicalize_git_repo_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn gix_open_opts_from_settings(settings: &UserSettings) -> gix::open::Options {
-    let user_name = settings.user_name();
-    let user_email = settings.user_email();
-    gix::open::Options::default()
-        .config_overrides([
-            // Committer has to be configured to record reflog. Author isn't
-            // needed, but let's copy the same values.
-            format!("author.name={user_name}"),
-            format!("author.email={user_email}"),
-            format!("committer.name={user_name}"),
-            format!("committer.email={user_email}"),
-        ])
-        // The git_target path should point the repository, not the working directory.
-        .open_path_as_is(true)
-        // Gitoxide recommends this when correctness is preferred
-        .strict_config(true)
-}
-
 /// Opens the Git repository at `git_dir` with grit-lib.
+///
+/// Like Git, a non-bare repository's work tree is `core.worktree`, or the
+/// parent directory of a `.git` directory.
 fn open_grit_repo(git_dir: &Path) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
-    open_grit_repo_with_work_tree(git_dir, None)
+    // A `.git` file links to the Git directory of a worktree, or of a
+    // repository stored elsewhere. Its directory is the work tree.
+    if git_dir.is_file() {
+        let linked_git_dir = grit_lib::repo::resolve_dot_git(git_dir)?;
+        return open_grit_repo_with_work_tree(&linked_git_dir, git_dir.parent());
+    }
+    let repo = open_grit_repo_with_work_tree(git_dir, None)?;
+    let config = repo.config()?;
+    let is_bare = match config.get_bool("core.bare") {
+        Some(Ok(bare)) => bare,
+        _ => git_dir.file_name() != Some(OsStr::new(".git")),
+    };
+    if is_bare {
+        return Ok(repo);
+    }
+    let work_tree = match config.get("core.worktree") {
+        Some(work_tree) => repo.git_dir().join(work_tree),
+        None => match git_dir.parent() {
+            Some(parent) if git_dir.file_name() == Some(OsStr::new(".git")) => parent.to_owned(),
+            _ => return Ok(repo),
+        },
+    };
+    open_grit_repo_with_work_tree(git_dir, Some(&work_tree))
 }
 
-fn open_grit_repo_with_work_tree(
+/// The process environment, as grit-lib sees it.
+pub(crate) fn grit_environment() -> grit_lib::prelude::Environment {
+    grit_lib::prelude::Environment::capture_process()
+}
+
+pub(crate) fn open_grit_repo_with_work_tree(
     git_dir: &Path,
     work_tree: Option<&Path>,
 ) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
-    let mut options = grit_lib::prelude::RepositoryOptions::with_environment(
-        grit_lib::prelude::Environment::capture_process(),
-    );
+    let mut options = grit_lib::prelude::RepositoryOptions::with_environment(grit_environment());
     if let Some(work_tree) = work_tree {
         options = options.with_work_tree(work_tree);
     }
@@ -1395,7 +1325,7 @@ impl Backend for GitBackend {
     }
 
     fn commit_id_length(&self) -> usize {
-        self.grit_repo.odb().hash_algo().len()
+        self.repo.odb().hash_algo().len()
     }
 
     fn change_id_length(&self) -> usize {
@@ -1440,7 +1370,7 @@ impl Backend for GitBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, id: &SymlinkId) -> BackendResult<String> {
-        let data = read_object_of_kind(&self.grit_repo, id, ObjectKind::Blob)?;
+        let data = read_object_of_kind(&self.repo, id, ObjectKind::Blob)?;
         let target =
             String::from_utf8(data).map_err(|err| to_invalid_utf8_err(err.utf8_error(), id))?;
         Ok(target)
@@ -1474,8 +1404,8 @@ impl Backend for GitBackend {
             return Ok(Tree::default());
         }
 
-        let data = read_object_of_kind(&self.grit_repo, id, ObjectKind::Tree)?;
-        let oid_len = self.grit_repo.odb().hash_algo().len();
+        let data = read_object_of_kind(&self.repo, id, ObjectKind::Tree)?;
+        let oid_len = self.repo.odb().hash_algo().len();
         let mut entries: Vec<_> = TreeRefIter::with_oid_len(&data, oid_len)
             .map(|entry| -> BackendResult<_> {
                 let entry = entry.map_err(|err| to_read_object_err(err, id))?;
@@ -1551,7 +1481,7 @@ impl Backend for GitBackend {
                 }
             })
             .collect_vec();
-        let oid = write_tree_entries(&self.grit_repo, entries)?;
+        let oid = write_tree_entries(&self.repo, entries)?;
         Ok(TreeId::from_bytes(oid.as_bytes()))
     }
 
@@ -1565,9 +1495,9 @@ impl Backend for GitBackend {
         }
 
         let mut commit = {
-            let data = read_object_of_kind(&self.grit_repo, id, ObjectKind::Commit)?;
+            let data = read_object_of_kind(&self.repo, id, ObjectKind::Commit)?;
             let is_shallow = self.shallow_root_ids()?.contains(id);
-            let hash_algo = self.grit_repo.odb().hash_algo();
+            let hash_algo = self.repo.odb().hash_algo();
             commit_from_git_without_root_parent(id, &data, hash_algo, is_shallow)?
         };
         if commit.parents.is_empty() {
@@ -1598,7 +1528,7 @@ impl Backend for GitBackend {
     ) -> BackendResult<(CommitId, Commit)> {
         assert!(contents.secure_sig.is_none(), "commit.secure_sig was set");
 
-        let repo = &self.grit_repo;
+        let repo = &self.repo;
         let hash_algo = repo.odb().hash_algo();
         let tree_ids = &contents.root_tree;
         let git_tree_id = match tree_ids.as_resolved() {
@@ -1726,7 +1656,7 @@ impl Backend for GitBackend {
 
         // Everything up to this point had no permanent effect on the repo except
         // GC-able objects
-        edit_references(&self.grit_repo, [to_no_gc_ref_update(&id)])?;
+        edit_references(&self.repo, [to_no_gc_ref_update(&id)])?;
 
         // Update the signature to match the one that was actually written to the object
         // store
@@ -1746,7 +1676,7 @@ impl Backend for GitBackend {
         let root_tree = self.read_tree_id_for_commit(root_id)?;
         let head_tree = self.read_tree_id_for_commit(head_id)?;
 
-        let hash_algo = self.grit_repo.odb().hash_algo();
+        let hash_algo = self.repo.odb().hash_algo();
         let empty_blob_id = grit_lib::objects::hash::hash_object(hash_algo, ObjectKind::Blob, b"")
             .map_err(|err| BackendError::Other(err.into()))?;
         let change_to_copy_record = |change: DiffEntry| -> BackendResult<Option<CopyRecord>> {
@@ -1783,7 +1713,7 @@ impl Backend for GitBackend {
             }))
         };
 
-        let odb = self.grit_repo.odb();
+        let odb = self.repo.odb();
         let mut changes = grit_lib::diff::diff_trees(odb, Some(&root_tree), Some(&head_tree), "")
             .map_err(|err| BackendError::Other(err.into()))?;
         // Unlike `git diff -C`, which copies from the preimage of modified
@@ -1816,7 +1746,7 @@ impl Backend for GitBackend {
             .iter()
             .filter(|id| *id != &self.root_commit_id)
             .collect();
-        recreate_no_gc_refs(&self.grit_repo, &new_heads, keep_newer)?;
+        recreate_no_gc_refs(&self.repo, &new_heads, keep_newer)?;
 
         // No locking is needed since we aren't going to add new "commits".
         let table = self.cached_extra_metadata_table()?;
@@ -1833,9 +1763,6 @@ impl Backend for GitBackend {
             keep_newer,
         )
         .map_err(|err| BackendError::Other(err.into()))?;
-        // Since "git gc" will move loose refs into packed refs, in-memory
-        // packed-refs cache should be invalidated without relying on mtime.
-        self.lock_git_repo().refs.force_refresh_packed_buffer().ok();
         Ok(())
     }
 }
@@ -1948,10 +1875,10 @@ fn write_tree_entries(
 mod tests {
     use std::assert_matches;
 
-    use gix::date::parse::TimeBuf;
-    use gix::objs::WriteTo as _;
     use indoc::indoc;
     use test_case::test_case;
+    use testutils::git::HashAlgo as GitHashAlgo;
+    use testutils::git::ObjectId as GitOid;
 
     use super::*;
     use crate::config::StackedConfig;
@@ -1960,35 +1887,29 @@ mod tests {
     use crate::tests::TestResult;
     use crate::tests::new_temp_dir;
 
-    const GIT_USER: &str = "Someone";
-    const GIT_EMAIL: &str = "someone@example.com";
-
-    fn git_config() -> Vec<bstr::BString> {
-        vec![
-            format!("user.name = {GIT_USER}").into(),
-            format!("user.email = {GIT_EMAIL}").into(),
-            "init.defaultBranch = master".into(),
-        ]
+    fn git_init(
+        directory: impl AsRef<Path>,
+        object_hash: GitHashAlgo,
+    ) -> testutils::git::Repository {
+        testutils::git::init_with_hash(directory, object_hash)
     }
 
-    fn open_options() -> gix::open::Options {
-        gix::open::Options::isolated()
-            .config_overrides(git_config())
-            .strict_config(true)
+    fn blob_entry(name: &str, oid: GitOid) -> testutils::git::TreeEntry {
+        testutils::git::TreeEntry {
+            mode: 0o100644,
+            name: name.into(),
+            oid,
+        }
     }
 
-    fn git_init(directory: impl AsRef<Path>, object_hash: gix::hash::Kind) -> gix::Repository {
-        gix::ThreadSafeRepository::init_opts(
-            directory,
-            gix::create::Kind::WithWorktree,
-            gix::create::Options {
-                object_hash: Some(object_hash),
-                ..Default::default()
-            },
-            open_options(),
-        )
-        .unwrap()
-        .to_thread_local()
+    /// Lists the ids the `refs/jj/keep/*` refs point to.
+    fn no_gc_ref_ids(git_repo: &grit_lib::repo::Repository) -> Vec<GitOid> {
+        let repo: testutils::git::Repository = open_grit_repo(git_repo.git_dir()).unwrap().into();
+        repo.list_references(NO_GC_REF_NAMESPACE)
+            .unwrap()
+            .iter()
+            .map(|git_ref| git_ref.id())
+            .collect()
     }
 
     #[test]
@@ -1999,9 +1920,9 @@ mod tests {
         fs::create_dir(&store_path)?;
 
         let git_repo_path = temp_dir.path().join("git1");
-        let git_repo = git_init(&git_repo_path, gix::hash::Kind::default());
+        let git_repo = git_init(&git_repo_path, GitHashAlgo::default());
         let other_git_repo_path = temp_dir.path().join("git2");
-        let _other_git_repo = git_init(&other_git_repo_path, gix::hash::Kind::default());
+        let _other_git_repo = git_init(&other_git_repo_path, GitHashAlgo::default());
 
         let worktree_dir = temp_dir.path().join("git1-wt");
         let output = Command::new("git")
@@ -2015,11 +1936,11 @@ mod tests {
 
         assert_matches!(
             backend.open_git_repo_at_workdir(&git_repo_path),
-            Ok(repo) if repo.workdir() == Some(backend.git_repo().workdir().unwrap())
+            Ok(repo) if repo.work_tree() == Some(backend.git_repo().work_tree().unwrap())
         );
         assert_matches!(
             backend.open_git_repo_at_workdir(&worktree_dir),
-            Ok(repo) if repo.workdir() == Some(worktree_dir.as_ref())
+            Ok(repo) if repo.work_tree() == Some(dunce::canonicalize(&worktree_dir)?.as_ref())
         );
         assert_matches!(
             backend.open_git_repo_at_workdir(&temp_dir.path().join("unknown")),
@@ -2033,9 +1954,9 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn read_plain_git_commit(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn read_plain_git_commit(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
@@ -2043,49 +1964,46 @@ mod tests {
         let git_repo = git_init(git_repo_path, object_hash);
 
         // Add a commit with some files in
-        let blob1 = git_repo.write_blob(b"content1")?.detach();
-        let blob2 = git_repo.write_blob(b"normal")?.detach();
-        let mut dir_tree_editor = git_repo.empty_tree().edit()?;
-        dir_tree_editor.upsert("normal", gix::object::tree::EntryKind::Blob, blob1)?;
-        dir_tree_editor.upsert("symlink", gix::object::tree::EntryKind::Link, blob2)?;
-        let dir_tree_id = dir_tree_editor.write()?.detach();
-        let mut root_tree_builder = git_repo.empty_tree().edit()?;
-        root_tree_builder.upsert("dir", gix::object::tree::EntryKind::Tree, dir_tree_id)?;
-        let root_tree_id = root_tree_builder.write()?.detach();
-        let git_author = gix::actor::Signature {
-            name: "git author".into(),
-            email: "git.author@example.com".into(),
-            time: gix::date::Time::new(1000, 60 * 60),
-        };
-        let git_committer = gix::actor::Signature {
-            name: "git committer".into(),
-            email: "git.committer@example.com".into(),
-            time: gix::date::Time::new(2000, -480 * 60),
-        };
-        let git_commit_id = git_repo
-            .commit_as(
-                git_committer.to_ref(&mut TimeBuf::default()),
-                git_author.to_ref(&mut TimeBuf::default()),
-                "refs/heads/dummy",
-                "git commit message",
-                root_tree_id,
-                [] as [gix::ObjectId; 0],
-            )?
-            .detach();
-        git_repo.find_reference("refs/heads/dummy")?.delete()?;
+        let blob1 = git_repo.write_blob(b"content1")?;
+        let blob2 = git_repo.write_blob(b"normal")?;
+        let dir_tree_id = git_repo.write_tree(vec![
+            blob_entry("normal", blob1),
+            testutils::git::TreeEntry {
+                mode: 0o120000,
+                name: "symlink".into(),
+                oid: blob2,
+            },
+        ])?;
+        let root_tree_id = git_repo.write_tree(vec![testutils::git::TreeEntry {
+            mode: 0o040000,
+            name: "dir".into(),
+            oid: dir_tree_id,
+        }])?;
+        let git_author =
+            testutils::git::signature("git author", "git.author@example.com", 1000, 60);
+        let git_committer =
+            testutils::git::signature("git committer", "git.committer@example.com", 2000, -480);
+        let git_commit_id = testutils::git::write_commit_as(
+            &git_repo,
+            None,
+            &git_author,
+            &git_committer,
+            root_tree_id,
+            &[],
+            "git commit message",
+        );
         // The change id is the leading reverse bits of the commit id
         let (commit_id, change_id) = match object_hash {
-            gix::hash::Kind::Sha1 => (
+            GitHashAlgo::Sha1 => (
                 CommitId::from_hex("efdcea5ca4b3658149f899ca7feee6876d077263"),
                 ChangeId::from_hex("c64ee0b6e16777fe53991f9281a6cd25"),
             ),
-            gix::hash::Kind::Sha256 => (
+            GitHashAlgo::Sha256 => (
                 CommitId::from_hex(
                     "64366022e4938d697015b775945be93aea6d3fc221feeaf7c516420262e3fa54",
                 ),
                 ChangeId::from_hex("2a5fc746404268a3ef577f8443fcb657"),
             ),
-            _ => unreachable!(),
         };
         // Check that the git commit above got the hash we expect
         assert_eq!(
@@ -2095,17 +2013,15 @@ mod tests {
         );
 
         // Add an empty commit on top
-        let git_commit_id2 = git_repo
-            .commit_as(
-                git_committer.to_ref(&mut TimeBuf::default()),
-                git_author.to_ref(&mut TimeBuf::default()),
-                "refs/heads/dummy2",
-                "git commit message 2",
-                root_tree_id,
-                [git_commit_id],
-            )?
-            .detach();
-        git_repo.find_reference("refs/heads/dummy2")?.delete()?;
+        let git_commit_id2 = testutils::git::write_commit_as(
+            &git_repo,
+            None,
+            &git_author,
+            &git_committer,
+            root_tree_id,
+            &[git_commit_id],
+            "git commit message 2",
+        );
         let commit_id2 = CommitId::from_bytes(git_commit_id2.as_bytes());
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
@@ -2113,19 +2029,14 @@ mod tests {
         // Import the head commit and its ancestors
         backend.import_head_commits([&commit_id2])?;
         // Ref should be created only for the head commit
-        let git_refs = backend
-            .git_repo()
-            .references()?
-            .prefixed("refs/jj/keep/")?
-            .map(|git_ref| git_ref.unwrap().id().detach())
-            .collect_vec();
+        let git_refs = no_gc_ref_ids(backend.git_repo());
         assert_eq!(git_refs, vec![git_commit_id2]);
 
         let commit = backend.read_commit(&commit_id).block_on()?;
         assert_eq!(&commit.change_id, &change_id);
         assert_eq!(
             commit.parents,
-            vec![CommitId::from_bytes(object_hash.null_ref().as_bytes())]
+            vec![CommitId::from_bytes(GitOid::null(object_hash).as_bytes())]
         );
         assert_eq!(commit.predecessors, vec![]);
         assert_eq!(
@@ -2198,29 +2109,26 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn read_git_commit_without_importing(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn read_git_commit_without_importing(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
         let git_repo_path = temp_dir.path().join("git");
         let git_repo = git_init(&git_repo_path, object_hash);
 
-        let signature = gix::actor::Signature {
-            name: GIT_USER.into(),
-            email: GIT_EMAIL.into(),
-            time: gix::date::Time::now_utc(),
-        };
-        let empty_tree_id = gix::ObjectId::empty_tree(git_repo.object_hash());
-        let git_commit_id = git_repo.commit_as(
-            signature.to_ref(&mut TimeBuf::default()),
-            signature.to_ref(&mut TimeBuf::default()),
-            "refs/heads/main",
-            "git commit message",
+        let signature = testutils::git::signature_now();
+        let empty_tree_id = git_repo.empty_tree_id();
+        let git_commit_id = testutils::git::write_commit_as(
+            &git_repo,
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
             empty_tree_id,
-            [] as [gix::ObjectId; 0],
-        )?;
+            &[],
+            "git commit message",
+        );
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
 
@@ -2242,43 +2150,41 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn read_signed_git_commit(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn read_signed_git_commit(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
         let git_repo_path = temp_dir.path().join("git");
         let git_repo = git_init(git_repo_path, object_hash);
 
-        let signature = gix::actor::Signature {
-            name: GIT_USER.into(),
-            email: GIT_EMAIL.into(),
-            time: gix::date::Time::now_utc(),
-        };
-        let empty_tree_id = gix::ObjectId::empty_tree(git_repo.object_hash());
+        let signature = testutils::git::signature_now();
+        let empty_tree_id = git_repo.empty_tree_id();
 
         let secure_sig =
             "here are some ASCII bytes to be used as a test signature\n\ndefinitely not PGP\n";
 
-        let mut commit = gix::objs::Commit {
-            tree: empty_tree_id,
-            parents: smallvec::SmallVec::new(),
-            author: signature.clone(),
-            committer: signature.clone(),
-            encoding: None,
-            message: "git commit message".into(),
-            extra_headers: Vec::new(),
-        };
-
-        let mut commit_buf = Vec::new();
-        commit.write_to(&mut commit_buf)?;
+        let commit_buf = testutils::git::commit_bytes(
+            &signature,
+            &signature,
+            empty_tree_id,
+            &[],
+            &[],
+            "git commit message",
+        );
         let commit_str = str::from_utf8(&commit_buf)?;
 
-        let field = gix::objs::commit::signature_field_name(object_hash);
-        commit.extra_headers.push((field.into(), secure_sig.into()));
-
-        let git_commit_id = git_repo.write_object(&commit)?;
+        let field = signature_field_name(object_hash);
+        let signed_commit = testutils::git::commit_bytes(
+            &signature,
+            &signature,
+            empty_tree_id,
+            &[],
+            &[(field, secure_sig)],
+            "git commit message",
+        );
+        let git_commit_id = git_repo.odb().write(ObjectKind::Commit, &signed_commit)?;
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
 
@@ -2364,9 +2270,9 @@ mod tests {
         );
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn round_trip_change_id_via_git_header(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn round_trip_change_id_via_git_header(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
 
@@ -2420,18 +2326,11 @@ mod tests {
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
         let git_repo_path = temp_dir.path().join("git");
-        let git_repo = git_init(git_repo_path, gix::hash::Kind::default());
+        let git_repo = git_init(git_repo_path, GitHashAlgo::default());
 
         // Git doesn't create such a tree, but one can be written by hand.
-        let blob_id = git_repo.write_blob(b"content")?.detach();
-        let tree = gix::objs::Tree {
-            entries: vec![gix::objs::tree::Entry {
-                mode: gix::object::tree::EntryKind::Blob.into(),
-                filename: "a/b".into(),
-                oid: blob_id,
-            }],
-        };
-        let tree_id = git_repo.write_object(&tree)?.detach();
+        let blob_id = git_repo.write_blob(b"content")?;
+        let tree_id = git_repo.write_raw_tree(&[blob_entry("a/b", blob_id)])?;
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
         let result = backend
@@ -2447,44 +2346,34 @@ mod tests {
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
         let git_repo_path = temp_dir.path().join("git");
-        let git_repo = git_init(git_repo_path, gix::hash::Kind::default());
+        let git_repo = git_init(git_repo_path, GitHashAlgo::default());
 
         // A file renamed to a name ending in "/", which git doesn't create but
         // can be written by hand. The new path, "file/", is not a valid repo
         // path.
-        let blob_id = git_repo.write_blob(b"content\n")?.detach();
-        let write_tree = |filename: &str| -> TestResult<gix::ObjectId> {
-            let tree = gix::objs::Tree {
-                entries: vec![gix::objs::tree::Entry {
-                    mode: gix::object::tree::EntryKind::Blob.into(),
-                    filename: filename.into(),
-                    oid: blob_id,
-                }],
-            };
-            Ok(git_repo.write_object(&tree)?.detach())
+        let blob_id = git_repo.write_blob(b"content\n")?;
+        let write_tree = |filename: &str| -> TestResult<GitOid> {
+            Ok(git_repo.write_raw_tree(&[blob_entry(filename, blob_id)])?)
         };
         let before_tree = write_tree("file")?;
         let after_tree = write_tree("file/")?;
-        let signature = gix::actor::Signature {
-            name: GIT_USER.into(),
-            email: GIT_EMAIL.into(),
-            time: gix::date::Time::now_utc(),
-        };
+        let signature = testutils::git::signature_now();
         let commit = |reference: &str, tree| {
-            git_repo.commit_as(
-                signature.to_ref(&mut TimeBuf::default()),
-                signature.to_ref(&mut TimeBuf::default()),
-                reference,
-                "commit",
+            testutils::git::write_commit_as(
+                &git_repo,
+                Some(reference),
+                &signature,
+                &signature,
                 tree,
-                [] as [gix::ObjectId; 0],
+                &[],
+                "commit",
             )
         };
-        let before = commit("refs/heads/before", before_tree)?.detach();
-        let after = commit("refs/heads/after", after_tree)?.detach();
+        let before = commit("refs/heads/before", before_tree);
+        let after = commit("refs/heads/after", after_tree);
 
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
-        let copy_records = |root: gix::ObjectId, head: gix::ObjectId| -> TestResult<Vec<_>> {
+        let copy_records = |root: GitOid, head: GitOid| -> TestResult<Vec<_>> {
             Ok(backend
                 .get_copy_records(
                     None,
@@ -2545,9 +2434,9 @@ mod tests {
     }
 
     /// Test that parents get written correctly
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn git_commit_parents(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn git_commit_parents(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
@@ -2641,9 +2530,9 @@ mod tests {
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn write_tree_conflicts(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn write_tree_conflicts(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let store_path = temp_dir.path();
@@ -2653,15 +2542,10 @@ mod tests {
         let backend = GitBackend::init_external(&settings, store_path, git_repo.path())?;
         let create_tree = |i| {
             let blob_id = git_repo.write_blob(format!("content {i}")).unwrap();
-            let mut tree_builder = git_repo.empty_tree().edit().unwrap();
-            tree_builder
-                .upsert(
-                    format!("file{i}"),
-                    gix::object::tree::EntryKind::Blob,
-                    blob_id,
-                )
+            let tree_id = git_repo
+                .write_tree(vec![blob_entry(&format!("file{i}"), blob_id)])
                 .unwrap();
-            TreeId::from_bytes(tree_builder.write().unwrap().as_bytes())
+            TreeId::from_bytes(tree_id.as_bytes())
         };
 
         let root_tree = Merge::from_removes_adds(
@@ -2689,58 +2573,55 @@ mod tests {
         let read_commit_id = write_commit(commit.clone())?.0;
         let read_commit = backend.read_commit(&read_commit_id).block_on()?;
         assert_eq!(read_commit, commit);
-        let git_commit = git_repo.find_commit(gix::ObjectId::from_bytes_or_panic(
-            read_commit_id.as_bytes(),
-        ))?;
-        let git_tree = git_repo.find_tree(git_commit.tree_id().unwrap())?;
+        let git_commit = git_repo.find_commit(GitOid::from_bytes(read_commit_id.as_bytes())?)?;
+        let git_tree = git_repo.find_tree(git_commit.tree_id())?;
         let jj_conflict_entries = git_tree
             .iter()
-            .map(Result::unwrap)
             .filter(|entry| {
-                entry.filename().starts_with(b".jjconflict")
-                    || entry.filename() == JJ_CONFLICT_README_FILE_NAME
+                entry.name.starts_with(b".jjconflict")
+                    || entry.name == JJ_CONFLICT_README_FILE_NAME.as_bytes()
             })
             .collect_vec();
         assert!(
             jj_conflict_entries
                 .iter()
-                .filter(|entry| entry.filename() != JJ_CONFLICT_README_FILE_NAME)
-                .all(|entry| entry.mode().value() == 0o040000)
+                .filter(|entry| entry.name != JJ_CONFLICT_README_FILE_NAME.as_bytes())
+                .all(|entry| entry.mode == 0o040000)
         );
         let mut iter = jj_conflict_entries.iter();
         let entry = iter.next().unwrap();
-        assert_eq!(entry.filename(), b".jjconflict-base-0");
+        assert_eq!(entry.name, b".jjconflict-base-0");
         assert_eq!(
-            entry.id().as_bytes(),
+            entry.oid.as_bytes(),
             root_tree.get_remove(0).unwrap().as_bytes()
         );
         let entry = iter.next().unwrap();
-        assert_eq!(entry.filename(), b".jjconflict-base-1");
+        assert_eq!(entry.name, b".jjconflict-base-1");
         assert_eq!(
-            entry.id().as_bytes(),
+            entry.oid.as_bytes(),
             root_tree.get_remove(1).unwrap().as_bytes()
         );
         let entry = iter.next().unwrap();
-        assert_eq!(entry.filename(), b".jjconflict-side-0");
+        assert_eq!(entry.name, b".jjconflict-side-0");
         assert_eq!(
-            entry.id().as_bytes(),
+            entry.oid.as_bytes(),
             root_tree.get_add(0).unwrap().as_bytes()
         );
         let entry = iter.next().unwrap();
-        assert_eq!(entry.filename(), b".jjconflict-side-1");
+        assert_eq!(entry.name, b".jjconflict-side-1");
         assert_eq!(
-            entry.id().as_bytes(),
+            entry.oid.as_bytes(),
             root_tree.get_add(1).unwrap().as_bytes()
         );
         let entry = iter.next().unwrap();
-        assert_eq!(entry.filename(), b".jjconflict-side-2");
+        assert_eq!(entry.name, b".jjconflict-side-2");
         assert_eq!(
-            entry.id().as_bytes(),
+            entry.oid.as_bytes(),
             root_tree.get_add(2).unwrap().as_bytes()
         );
         let entry = iter.next().unwrap();
-        assert_eq!(entry.filename(), b"JJ-CONFLICT-README");
-        assert_eq!(entry.mode().value(), 0o100644);
+        assert_eq!(entry.name, b"JJ-CONFLICT-README");
+        assert_eq!(entry.mode, 0o100644);
         assert!(iter.next().is_none());
 
         // When writing a single tree using the new format, it's represented by a
@@ -2749,19 +2630,17 @@ mod tests {
         let read_commit_id = write_commit(commit.clone())?.0;
         let read_commit = backend.read_commit(&read_commit_id).block_on()?;
         assert_eq!(read_commit, commit);
-        let git_commit = git_repo.find_commit(gix::ObjectId::from_bytes_or_panic(
-            read_commit_id.as_bytes(),
-        ))?;
+        let git_commit = git_repo.find_commit(GitOid::from_bytes(read_commit_id.as_bytes())?)?;
         assert_eq!(
-            Merge::resolved(TreeId::from_bytes(git_commit.tree_id().unwrap().as_bytes())),
+            Merge::resolved(TreeId::from_bytes(git_commit.tree_id().as_bytes())),
             commit.root_tree
         );
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn commit_has_ref(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn commit_has_ref(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let backend = GitBackend::init_internal(&settings, temp_dir.path(), object_hash)?;
@@ -2786,68 +2665,51 @@ mod tests {
             secure_sig: None,
         };
         let commit_id = backend.write_commit(commit, None).block_on()?.0;
-        let git_refs = git_repo.references()?;
-        let git_ref_ids: Vec<_> = git_refs
-            .prefixed("refs/jj/keep/")?
-            .map(|x| x.unwrap().id().detach())
-            .collect();
+        let git_ref_ids = no_gc_ref_ids(git_repo);
         assert!(git_ref_ids.iter().any(|id| *id == git_id(&commit_id)));
 
         // Concurrently-running GC deletes the ref, leaving the extra metadata.
-        for git_ref in git_refs.prefixed("refs/jj/keep/")? {
-            git_ref.unwrap().delete().unwrap();
+        let test_git_repo: testutils::git::Repository = backend.reopen_git_repo()?.into();
+        for git_ref in test_git_repo.list_references("refs/jj/keep/")? {
+            git_ref.delete().unwrap();
         }
         // Re-imported commit should have new ref.
         backend.import_head_commits([&commit_id])?;
-        let git_refs = git_repo.references()?;
-        let git_ref_ids: Vec<_> = git_refs
-            .prefixed("refs/jj/keep/")?
-            .map(|x| x.unwrap().id().detach())
-            .collect();
+        let git_ref_ids = no_gc_ref_ids(git_repo);
         assert!(git_ref_ids.iter().any(|id| *id == git_id(&commit_id)));
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn import_head_commits_duplicates(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn import_head_commits_duplicates(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let backend = GitBackend::init_internal(&settings, temp_dir.path(), object_hash)?;
-        let git_repo = backend.git_repo();
+        let git_repo: testutils::git::Repository = backend.reopen_git_repo()?.into();
 
-        let signature = gix::actor::Signature {
-            name: GIT_USER.into(),
-            email: GIT_EMAIL.into(),
-            time: gix::date::Time::now_utc(),
-        };
-        let empty_tree_id = gix::ObjectId::empty_tree(git_repo.object_hash());
-        let git_commit_id = git_repo
-            .commit_as(
-                signature.to_ref(&mut TimeBuf::default()),
-                signature.to_ref(&mut TimeBuf::default()),
-                "refs/heads/main",
-                "git commit message",
-                empty_tree_id,
-                [] as [gix::ObjectId; 0],
-            )?
-            .detach();
+        let signature = testutils::git::signature_now();
+        let empty_tree_id = git_repo.empty_tree_id();
+        let git_commit_id = testutils::git::write_commit_as(
+            &git_repo,
+            Some("refs/heads/main"),
+            &signature,
+            &signature,
+            empty_tree_id,
+            &[],
+            "git commit message",
+        );
         let commit_id = CommitId::from_bytes(git_commit_id.as_bytes());
 
         // Ref creation shouldn't fail because of duplicated head ids.
         backend.import_head_commits([&commit_id, &commit_id])?;
-        assert!(
-            git_repo
-                .references()?
-                .prefixed("refs/jj/keep/")?
-                .any(|git_ref| git_ref.unwrap().id().detach() == git_commit_id)
-        );
+        assert!(no_gc_ref_ids(&git_repo).contains(&git_commit_id));
         Ok(())
     }
 
-    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
-    #[test_case(gix::hash::Kind::Sha256; "sha256")]
-    fn overlapping_git_commit_id(object_hash: gix::hash::Kind) -> TestResult {
+    #[test_case(GitHashAlgo::Sha1 ; "sha1")]
+    #[test_case(GitHashAlgo::Sha256; "sha256")]
+    fn overlapping_git_commit_id(object_hash: GitHashAlgo) -> TestResult {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let backend = GitBackend::init_internal(&settings, temp_dir.path(), object_hash)?;
@@ -2888,7 +2750,7 @@ mod tests {
 
     #[test]
     fn write_signed_commit_sha1() -> TestResult {
-        let (obj, sig) = write_signed_commit(gix::hash::Kind::Sha1)?;
+        let (obj, sig) = write_signed_commit(GitHashAlgo::Sha1)?;
         insta::assert_snapshot!(&obj, @"
         tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
         author Someone <someone@example.com> 0 +0000
@@ -2916,7 +2778,7 @@ mod tests {
 
     #[test]
     fn write_signed_commit_sha256() -> TestResult {
-        let (obj, sig) = write_signed_commit(gix::hash::Kind::Sha256)?;
+        let (obj, sig) = write_signed_commit(GitHashAlgo::Sha256)?;
         insta::assert_snapshot!(&obj, @"
         tree 6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321
         author Someone <someone@example.com> 0 +0000
@@ -2942,7 +2804,7 @@ mod tests {
         Ok(())
     }
 
-    fn write_signed_commit(object_hash: gix::hash::Kind) -> TestResult<(String, SecureSig)> {
+    fn write_signed_commit(object_hash: GitHashAlgo) -> TestResult<(String, SecureSig)> {
         let settings = user_settings();
         let temp_dir = new_temp_dir();
         let backend = GitBackend::init_internal(&settings, temp_dir.path(), object_hash)?;
@@ -2974,18 +2836,18 @@ mod tests {
         assert_eq!(&sig, &returned_sig);
 
         let git_repo = backend.git_repo();
-        let obj = git_repo.find_object(gix::ObjectId::from_bytes_or_panic(id.as_bytes()))?;
-        Ok((String::from_utf8(obj.data.clone())?, sig))
+        let obj = git_repo.odb().read(&GitOid::from_bytes(id.as_bytes())?)?;
+        Ok((String::from_utf8(obj.data)?, sig))
     }
 
-    fn git_id(commit_id: &CommitId) -> gix::ObjectId {
-        gix::ObjectId::from_bytes_or_panic(commit_id.as_bytes())
+    fn git_id(commit_id: &CommitId) -> GitOid {
+        GitOid::from_bytes(commit_id.as_bytes()).unwrap()
     }
 
     fn create_signature() -> Signature {
         Signature {
-            name: GIT_USER.to_string(),
-            email: GIT_EMAIL.to_string(),
+            name: "Someone".to_string(),
+            email: "someone@example.com".to_string(),
             timestamp: Timestamp {
                 timestamp: MillisSinceEpoch(0),
                 tz_offset: 0,

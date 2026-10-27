@@ -17,7 +17,6 @@ use std::fmt::Debug;
 use std::io::Write as _;
 use std::sync::Arc;
 
-use bstr::BStr;
 use futures::TryStreamExt as _;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
@@ -274,11 +273,17 @@ fn calculate_push_remote(
     remote: Option<&str>,
 ) -> Result<String, CommandError> {
     let git_repo = git::get_git_repo(store)?; // will fail if not a git repo
-    let remotes = git_repo.remote_names();
+    let remotes: Vec<String> = git_repo
+        .remotes()
+        .configured()
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|remote| remote.name)
+        .collect();
 
     // If --remote was provided, use that
     if let Some(remote) = remote {
-        if remotes.contains(BStr::new(&remote)) {
+        if remotes.iter().any(|r| r == remote) {
             return Ok(remote.to_string());
         }
         return Err(user_error(format!(
@@ -288,7 +293,7 @@ fn calculate_push_remote(
 
     // If the Gerrit-specific config was set, use that
     if let Ok(remote) = settings.get_string("gerrit.default-remote") {
-        if remotes.contains(BStr::new(&remote)) {
+        if remotes.contains(&remote) {
             return Ok(remote);
         }
         return Err(user_error(format!(
@@ -296,9 +301,22 @@ fn calculate_push_remote(
         )));
     }
 
-    // If a general push remote was configured, use that
-    if let Some(remote) = git_repo.remote_default_name(gix::remote::Direction::Push) {
-        return Ok(remote.to_string());
+    // If a general push remote was configured, use that. Like Git, fall back
+    // to the only remote, or to "origin".
+    let push_default = git_repo
+        .config()
+        .map_err(internal_error)?
+        .get("remote.pushDefault");
+    let default_remote = push_default.or_else(|| match remotes.as_slice() {
+        [] => None,
+        [remote] => Some(remote.clone()),
+        _ => remotes
+            .iter()
+            .any(|r| r == "origin")
+            .then(|| "origin".to_owned()),
+    });
+    if let Some(remote) = default_remote {
+        return Ok(remote);
     }
 
     // If there is a Git remote called "gerrit", use that

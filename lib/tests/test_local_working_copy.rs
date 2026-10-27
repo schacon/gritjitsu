@@ -28,7 +28,6 @@ use std::time::SystemTime;
 use bstr::BString;
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
-use gix::odb::pack::FindExt as _;
 use indoc::indoc;
 use itertools::Itertools as _;
 use jj_lib::backend::CopyId;
@@ -3270,18 +3269,16 @@ fn test_snapshot_and_update_valid_symlink(
 fn test_always_store_empty_tree() -> TestResult {
     let mut test_workspace = TestWorkspace::init_with_backend(TestRepoBackend::Git);
     let git_backend = get_git_backend(test_workspace.repo.store())?;
-    let git_repo = git_backend.git_repo();
-    let empty_tree_id = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
+    let git_repo = git_backend.reopen_git_repo()?;
+    let empty_tree_id = git_repo.odb().empty_tree_oid()?.to_hex();
 
     test_workspace.snapshot()?;
 
-    let mut buf = Vec::new();
-    // Use objects.find as it doesn't short-circuit when asked for the empty tree
-    let (empty_tree, _) = git_repo
-        .objects
-        .find(&empty_tree_id, &mut buf)
+    // Check the object file because reading the empty tree object always
+    // succeeds.
+    let (dir, file) = empty_tree_id.split_at(2);
+    let empty_tree = std::fs::read(git_repo.git_dir().join("objects").join(dir).join(file))
         .expect("empty tree should be stored in the git repo");
-    assert_eq!(empty_tree.kind, gix::objs::Kind::Tree);
-    assert!(empty_tree.data.is_empty());
+    assert!(!empty_tree.is_empty());
     Ok(())
 }

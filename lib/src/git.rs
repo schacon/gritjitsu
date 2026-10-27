@@ -32,19 +32,18 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
 use std::ffi::OsString;
-use std::fs::File;
 use std::iter;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bstr::BStr;
 use bstr::BString;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::stream;
-use gix::refspec::Instruction;
+use grit_lib::config::ConfigFile;
+use grit_lib::config::ConfigScope;
 use grit_lib::index::Index as GitIndex;
 use grit_lib::index::IndexEntry;
 use grit_lib::index::MODE_EXECUTABLE;
@@ -201,11 +200,29 @@ pub enum GitRemoteNameError {
     #[error("Git remotes with slashes are incompatible with jj: {}", .0.as_symbol())]
     WithSlash(RemoteNameBuf),
     #[error("Invalid Git remote name")]
-    InvalidName(#[from] gix::Error),
+    InvalidName(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+#[derive(Debug, Error)]
+#[error("remote names must be valid within refspecs for fetching: {name}")]
+struct InvalidRemoteNameError {
+    name: String,
+    source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 fn validate_remote_name(name: &RemoteName) -> Result<(), GitRemoteNameError> {
-    gix::remote::name::validated(name.as_str())?;
+    // A remote name must be usable as part of a ref name.
+    grit_lib::refs::store::RefName::try_from(&format!("refs/remotes/{}", name.as_str())).map_err(
+        |source| {
+            GitRemoteNameError::InvalidName(
+                InvalidRemoteNameError {
+                    name: name.as_str().to_owned(),
+                    source: source.into(),
+                }
+                .into(),
+            )
+        },
+    )?;
     if name == REMOTE_NAME_FOR_LOCAL_GIT_REPO {
         Err(GitRemoteNameError::ReservedForLocalGitRepo)
     } else if name.as_str().contains('/') {
@@ -459,9 +476,14 @@ pub fn get_git_backend(store: &Store) -> Result<&GitBackend, UnexpectedGitBacken
     store.backend_impl().ok_or(UnexpectedGitBackendError)
 }
 
-/// Returns new thread-local instance to access to the underlying Git repo.
-pub fn get_git_repo(store: &Store) -> Result<gix::Repository, UnexpectedGitBackendError> {
-    get_git_backend(store).map(|backend| backend.git_repo())
+/// Opens a new handle to the underlying Git repo, reading its current
+/// configuration.
+pub fn get_git_repo(store: &Store) -> Result<GritRepository, UnexpectedGitBackendError> {
+    get_git_backend(store).map(|backend| {
+        backend
+            .reopen_git_repo()
+            .expect("Git repository should still be readable")
+    })
 }
 
 /// Checks if `git_ref` points to a Git commit object, and returns its id.
@@ -616,7 +638,7 @@ pub async fn import_some_refs(
     let store = mut_repo.store().clone();
     let git_backend = get_git_backend(&store)?;
     let refs_to_import =
-        diff_refs_to_import(mut_repo.view(), git_backend.grit_repo(), git_ref_filter)?;
+        diff_refs_to_import(mut_repo.view(), git_backend.git_repo(), git_ref_filter)?;
     import_refs_inner(mut_repo, refs_to_import, options).await
 }
 
@@ -1171,7 +1193,7 @@ pub async fn import_head(
     let store = mut_repo.store();
     let git_backend = get_git_backend(store)?;
     let git_repo = git_backend
-        .open_grit_repo_at_workdir(workspace_root)
+        .open_git_repo_at_workdir(workspace_root)
         .map_err(GitImportError::from_git)?;
 
     let old_git_head = mut_repo.view().git_head(workspace_name);
@@ -1208,7 +1230,7 @@ pub async fn import_head_commit(
 ) -> Result<Option<Commit>, GitImportError> {
     let store = mut_repo.store();
     let git_backend = get_git_backend(store)?;
-    let git_repo = git_backend.grit_repo();
+    let git_repo = git_backend.git_repo();
 
     let Some(oid) = resolve_head_id(git_repo) else {
         return Ok(None);
@@ -1380,7 +1402,7 @@ pub fn export_some_refs(
     };
 
     let git_repo = git_backend
-        .reopen_grit_repo()
+        .reopen_git_repo()
         .map_err(GitExportError::from_git)?;
 
     check_and_detach_head(&git_repo)?;
@@ -1990,7 +2012,7 @@ pub fn create_worktree(
     // working-copy commit turns out to have a real parent, the HEAD export
     // replaces this with a detached HEAD.
     let git_repo = git_backend
-        .open_grit_repo_at_workdir(destination)
+        .open_git_repo_at_workdir(destination)
         .map_err(GitCreateWorktreeError::from_git)?;
     update_git_head(
         &git_repo,
@@ -2102,7 +2124,7 @@ pub async fn reset_head(
 ) -> Result<(), GitResetHeadError> {
     let git_backend = get_git_backend(mut_repo.store())?;
     let grit_repo = git_backend
-        .open_grit_repo_at_workdir(workspace_root)
+        .open_git_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
     let identity = git_backend.reflog_identity().to_owned();
 
@@ -2417,7 +2439,7 @@ pub async fn update_intent_to_add(
 ) -> Result<(), GitResetHeadError> {
     let git_backend = get_git_backend(repo.store())?;
     let git_repo = git_backend
-        .open_grit_repo_at_workdir(workspace_root)
+        .open_git_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
     let mut index = git_repo
         .index_handle()
@@ -2523,15 +2545,19 @@ pub enum GitRemoteManagementError {
     #[error("Git remote named '{}' has nonstandard configuration", .0.as_symbol())]
     NonstandardConfiguration(RemoteNameBuf),
     #[error("Error saving Git configuration")]
-    GitConfigSaveError(#[source] std::io::Error),
-    #[error("Unexpected Git error when managing remotes")]
-    InternalGitError(#[from] gix::Error),
+    GitConfigSaveError(#[source] GritError),
     #[error("Unexpected Git error when managing remotes")]
     InternalError(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     UnexpectedBackend(#[from] UnexpectedGitBackendError),
     #[error(transparent)]
     RefExpansionError(#[from] GitRefExpansionError),
+}
+
+impl GitRemoteManagementError {
+    fn from_git(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self::InternalError(source.into())
+    }
 }
 
 fn default_fetch_refspec(remote: &RemoteName) -> String {
@@ -2553,131 +2579,261 @@ fn remove_ref(reference: GitRef) -> RefUpdate {
     ref_update(reference.name, None, expected, None)
 }
 
-/// Save an edited [`gix::config::File`] to its original location on disk.
-///
-/// Note that the resulting configuration changes are *not* persisted to the
-/// originating [`gix::Repository`]! The repository must be reloaded with the
-/// new configuration if necessary.
-pub fn save_git_config(config: &gix::config::File) -> std::io::Result<()> {
-    let mut config_file = File::create(
-        config
-            .meta()
-            .path
-            .as_ref()
-            .expect("Git repository to have a config file"),
-    )?;
-    config.write_to_filter(&mut config_file, |section| section.meta() == config.meta())
+/// Loads the repository-local Git config file for editing.
+pub fn load_local_git_config(git_repo: &GritRepository) -> Result<ConfigFile, GritError> {
+    let path = grit_lib::repo::local_config_write_path(git_repo.git_dir());
+    Ok(ConfigFile::from_path(&path, ConfigScope::Local)?
+        .unwrap_or_else(|| ConfigFile::parse(&path, "", ConfigScope::Local).unwrap()))
 }
 
-fn save_remote(
-    config: &mut gix::config::File,
-    remote_name: &RemoteName,
-    remote: &mut gix::Remote,
-) -> Result<(), GitRemoteManagementError> {
-    // Work around the gitoxide remote management bug
-    // <https://github.com/GitoxideLabs/gitoxide/issues/1951> by adding
-    // an empty section.
-    //
-    // Note that this will produce useless empty sections if we ever
-    // support remote configuration keys other than `fetch` and `url`.
-    config.new_section("remote", remote_name.as_str())?;
-    remote.save_as_to(remote_name.as_str(), config)?;
+/// Saves an edited repository-local Git config file.
+///
+/// Note that the resulting configuration changes are *not* visible to
+/// already-open repository handles. They must be reloaded if necessary.
+pub fn save_git_config(config: &ConfigFile) -> Result<(), GritError> {
+    config.write()
+}
+
+/// A remote configured in Git config.
+#[derive(Clone, Debug)]
+pub struct GitRemote {
+    name: String,
+    url: Option<String>,
+    push_urls: Vec<String>,
+    fetch_url: Option<String>,
+    push_url: Option<String>,
+    fetch_refspecs: Vec<String>,
+    push_refspecs: Vec<String>,
+}
+
+impl GitRemote {
+    fn load(
+        git_repo: &GritRepository,
+        name: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let config = git_repo.config()?;
+        let configured = git_repo
+            .remotes()
+            .configured()?
+            .into_iter()
+            .find(|remote| remote.name == name);
+        let push_refspecs = config.get_all(&format!("remote.{name}.push"));
+        if let Some(remote) = &configured {
+            for (key, url) in itertools::chain(
+                remote.url.iter().map(|url| ("url", url)),
+                remote.push_urls.iter().map(|url| ("pushurl", url)),
+            ) {
+                validate_git_url(url).map_err(|err| {
+                    format!("The URL in `remote.{name}.{key}` is invalid: {url:?}: {err}")
+                })?;
+            }
+        }
+        Ok(match configured {
+            Some(remote) => Self {
+                name: remote.name,
+                url: remote.url.filter(|url| !url.is_empty()),
+                push_urls: remote.push_urls,
+                fetch_url: remote.effective_fetch_url.filter(|url| !url.is_empty()),
+                push_url: remote.effective_push_url.filter(|url| !url.is_empty()),
+                fetch_refspecs: remote.fetch_refspecs,
+                push_refspecs,
+            },
+            None => Self {
+                name: name.to_owned(),
+                url: None,
+                push_urls: vec![],
+                fetch_url: None,
+                push_url: None,
+                fetch_refspecs: vec![],
+                push_refspecs,
+            },
+        })
+    }
+
+    /// The URL to fetch from, after applying `url.*.insteadOf`.
+    pub fn fetch_url(&self) -> Option<&str> {
+        self.fetch_url.as_deref()
+    }
+
+    /// The URL to push to, after applying `url.*.pushInsteadOf`. This is the
+    /// fetch URL if no push URL is configured.
+    pub fn push_url(&self) -> Option<&str> {
+        self.push_url.as_deref()
+    }
+
+    /// The configured URL, without applying `url.*.insteadOf`.
+    pub fn configured_url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    /// The configured push URL, without applying `url.*.pushInsteadOf`. This
+    /// is the configured URL if no push URL is configured.
+    pub fn configured_push_url(&self) -> Option<&str> {
+        self.push_urls
+            .first()
+            .map(String::as_str)
+            .or_else(|| self.configured_url())
+    }
+
+    /// The configured fetch refspecs.
+    pub fn fetch_refspecs(&self) -> &[String] {
+        &self.fetch_refspecs
+    }
+
+    fn is_active(&self) -> bool {
+        self.fetch_url.is_some() || self.push_url.is_some()
+    }
+
+    /// Writes the remote to `config`, replacing its URL and refspec values.
+    fn save_to(&self, config: &mut ConfigFile) -> Result<(), GritError> {
+        let name = &self.name;
+        for key in ["url", "pushurl", "tagopt", "fetch", "push"] {
+            config.unset(&format!("remote.{name}.{key}"))?;
+        }
+        if let Some(url) = &self.url {
+            config.add_value(&format!("remote.{name}.url"), url)?;
+        }
+        for url in &self.push_urls {
+            config.add_value(&format!("remote.{name}.pushurl"), url)?;
+        }
+        for refspec in &self.fetch_refspecs {
+            config.add_value(&format!("remote.{name}.fetch"), refspec)?;
+        }
+        for refspec in &self.push_refspecs {
+            config.add_value(&format!("remote.{name}.push"), refspec)?;
+        }
+        Ok(())
+    }
+}
+
+/// Checks that a URL-like remote location can be parsed.
+fn validate_git_url(url: &str) -> Result<(), &'static str> {
+    if let Some((scheme, rest)) = url.split_once("://")
+        && !scheme.eq_ignore_ascii_case("file")
+    {
+        let authority = rest
+            .split_once('/')
+            .map_or(rest, |(authority, _)| authority);
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if host.is_empty() {
+            return Err("URL scheme requires a host");
+        }
+    }
     Ok(())
 }
 
-fn git_config_branch_section_ids_by_remote(
-    config: &gix::config::File,
+/// Splits a config key like `branch.feature.x.remote` into the section name
+/// (`branch.feature.x`) and the variable name (`remote`).
+fn split_config_key(key: &str) -> Option<(&str, &str)> {
+    key.rsplit_once('.')
+}
+
+/// Returns the `branch.<name>` sections that refer to `remote_name`.
+fn git_config_branch_sections_by_remote(
+    config: &ConfigFile,
     remote_name: &RemoteName,
-) -> Result<Vec<gix::config::file::SectionId>, GitRemoteManagementError> {
-    config
-        .sections_by_name("branch")
-        .into_iter()
-        .flatten()
-        .filter_map(|section| {
-            let remote_values = section.values("remote");
-            let push_remote_values = section.values("pushRemote");
-            if !remote_values
+) -> Result<Vec<String>, GitRemoteManagementError> {
+    let mut sections: Vec<&str> = config
+        .entries
+        .iter()
+        .filter_map(|entry| split_config_key(&entry.key))
+        .filter(|(section, _)| section.starts_with("branch."))
+        .map(|(section, _)| section)
+        .collect();
+    sections.dedup();
+    let mut result = vec![];
+    for section in sections {
+        let values = |name: &str| {
+            config
+                .entries
                 .iter()
-                .chain(push_remote_values.iter())
-                .any(|branch_remote_name| branch_remote_name == remote_name.as_str())
-            {
-                return None;
-            }
-            // https://github.com/jj-vcs/jj/issues/6984#issuecomment-3073761797
-            let is_supported_key = |name: &str| -> bool {
-                name.eq_ignore_ascii_case("remote")
-                    || name.eq_ignore_ascii_case("merge")
-                    || name.eq_ignore_ascii_case("rebase")
-            };
-            if remote_values.len() > 1
-                || push_remote_values.len() > 1
-                || !section.value_names().all(|name| is_supported_key(&name))
-            {
-                return Some(Err(GitRemoteManagementError::NonstandardConfiguration(
-                    remote_name.to_owned(),
-                )));
-            }
-            Some(Ok(section.id()))
-        })
-        .collect()
+                .filter(|entry| split_config_key(&entry.key) == Some((section, name)))
+                .map(|entry| entry.value.as_deref().unwrap_or(""))
+                .collect_vec()
+        };
+        let remote_values = values("remote");
+        let push_remote_values = values("pushremote");
+        if !remote_values
+            .iter()
+            .chain(push_remote_values.iter())
+            .any(|branch_remote_name| *branch_remote_name == remote_name.as_str())
+        {
+            continue;
+        }
+        // https://github.com/jj-vcs/jj/issues/6984#issuecomment-3073761797
+        let is_supported_key = |name: &str| -> bool {
+            name.eq_ignore_ascii_case("remote")
+                || name.eq_ignore_ascii_case("merge")
+                || name.eq_ignore_ascii_case("rebase")
+        };
+        let all_keys_supported = config
+            .entries
+            .iter()
+            .filter_map(|entry| split_config_key(&entry.key))
+            .filter(|(entry_section, _)| *entry_section == section)
+            .all(|(_, name)| is_supported_key(name));
+        if remote_values.len() > 1 || push_remote_values.len() > 1 || !all_keys_supported {
+            return Err(GitRemoteManagementError::NonstandardConfiguration(
+                remote_name.to_owned(),
+            ));
+        }
+        result.push(section.to_owned());
+    }
+    Ok(result)
 }
 
 fn rename_remote_in_git_branch_config_sections(
-    config: &mut gix::config::File,
+    config: &mut ConfigFile,
     old_remote_name: &RemoteName,
     new_remote_name: &RemoteName,
 ) -> Result<(), GitRemoteManagementError> {
-    for id in git_config_branch_section_ids_by_remote(config, old_remote_name)? {
+    for section in git_config_branch_sections_by_remote(config, old_remote_name)? {
         config
-            .section_mut_by_id(id)
-            .expect("found section to exist")
-            .set("remote", new_remote_name.as_str())
-            .expect("'remote' to be a valid value name");
+            .set(&format!("{section}.remote"), new_remote_name.as_str())
+            .map_err(GitRemoteManagementError::from_git)?;
     }
     Ok(())
 }
 
 fn remove_remote_git_branch_config_sections(
-    config: &mut gix::config::File,
+    config: &mut ConfigFile,
     remote_name: &RemoteName,
 ) -> Result<(), GitRemoteManagementError> {
-    for id in git_config_branch_section_ids_by_remote(config, remote_name)? {
+    for section in git_config_branch_sections_by_remote(config, remote_name)? {
         config
-            .remove_section_by_id(id)
-            .expect("removed section to exist");
+            .remove_section(&section)
+            .map_err(GitRemoteManagementError::from_git)?;
     }
     Ok(())
 }
 
 fn remove_remote_git_config_sections(
-    config: &mut gix::config::File,
+    config: &mut ConfigFile,
     remote_name: &RemoteName,
 ) -> Result<(), GitRemoteManagementError> {
-    let section_ids_to_remove: Vec<_> = config
-        .sections_by_name("remote")
-        .into_iter()
-        .flatten()
-        .filter(|section| {
-            section.header().subsection_name() == Some(BStr::new(remote_name.as_str()))
-        })
-        .map(|section| {
-            if section.value_names().any(|name| {
-                !name.eq_ignore_ascii_case("url")
-                    && !name.eq_ignore_ascii_case("fetch")
-                    && !name.eq_ignore_ascii_case("tagOpt")
-            }) {
-                return Err(GitRemoteManagementError::NonstandardConfiguration(
-                    remote_name.to_owned(),
-                ));
-            }
-            Ok(section.id())
-        })
-        .try_collect()?;
-    for id in section_ids_to_remove {
-        config
-            .remove_section_by_id(id)
-            .expect("removed section to exist");
+    let section = format!("remote.{}", remote_name.as_str());
+    let has_unsupported_keys = config
+        .entries
+        .iter()
+        .filter_map(|entry| split_config_key(&entry.key))
+        .filter(|(entry_section, _)| *entry_section == section)
+        .any(|(_, name)| {
+            !name.eq_ignore_ascii_case("url")
+                && !name.eq_ignore_ascii_case("fetch")
+                && !name.eq_ignore_ascii_case("tagOpt")
+        });
+    if has_unsupported_keys {
+        return Err(GitRemoteManagementError::NonstandardConfiguration(
+            remote_name.to_owned(),
+        ));
     }
+    // Remove all sections with this name.
+    while config
+        .remove_section(&section)
+        .map_err(GitRemoteManagementError::from_git)?
+    {}
     Ok(())
 }
 
@@ -2689,43 +2845,32 @@ pub fn get_all_remote_names(
     Ok(iter_remote_names(&git_repo).collect())
 }
 
-fn iter_remote_names(git_repo: &gix::Repository) -> impl Iterator<Item = RemoteNameBuf> {
+fn iter_remote_names(git_repo: &GritRepository) -> impl Iterator<Item = RemoteNameBuf> {
     git_repo
-        .remote_names()
+        .remotes()
+        .configured()
+        .unwrap_or_default()
         .into_iter()
-        // ignore non-UTF-8 remote names which we don't support
-        .filter_map(|name| String::from_utf8(name.into()).ok())
-        .map(RemoteNameBuf::from)
         // exclude empty [remote "<name>"] section
-        .filter(|name| try_find_active_remote_inner(git_repo, name).is_some())
+        .filter(|remote| {
+            remote.effective_fetch_url.is_some() || remote.effective_push_url.is_some()
+        })
+        .map(|remote| RemoteNameBuf::from(remote.name))
 }
 
 /// Finds a configured remote with the given `name`. Returns `None` if it
 /// doesn't exist or has no fetch or push URLs.
-pub fn try_find_active_remote<'a>(
-    git_repo: &'a gix::Repository,
+pub fn try_find_active_remote(
+    git_repo: &GritRepository,
     name: &RemoteName,
-) -> Result<Option<gix::Remote<'a>>, GitRemoteManagementError> {
-    try_find_active_remote_inner(git_repo, name)
-        .transpose()
-        .map_err(GitRemoteManagementError::InternalGitError)
+) -> Result<Option<GitRemote>, GitRemoteManagementError> {
+    let remote =
+        GitRemote::load(git_repo, name.as_str()).map_err(GitRemoteManagementError::from_git)?;
+    Ok(Some(remote).filter(GitRemote::is_active))
 }
 
-fn try_find_active_remote_inner<'a>(
-    git_repo: &'a gix::Repository,
-    name: &RemoteName,
-) -> Option<gix::Result<gix::Remote<'a>>> {
-    // Since gix v0.86.0, try_find_remote() no longer filters out remotes
-    // without configured URLs.
-    git_repo
-        .try_find_remote(name.as_str())
-        .filter(|result| match result {
-            Ok(remote) => {
-                remote.url(gix::remote::Direction::Fetch).is_some()
-                    || remote.url(gix::remote::Direction::Push).is_some()
-            }
-            Err(_) => true,
-        })
+fn try_find_active_remote_inner(git_repo: &GritRepository, name: &RemoteName) -> Option<GitRemote> {
+    try_find_active_remote(git_repo, name).ok().flatten()
 }
 
 pub fn add_remote(
@@ -2744,20 +2889,21 @@ pub fn add_remote(
         ));
     }
 
-    let mut remote = git_repo
-        .remote_at(url)?
-        .with_refspecs(
-            [default_fetch_refspec(remote_name).as_bytes()],
-            gix::remote::Direction::Fetch,
-        )
-        .expect("default refspec to be valid");
+    let remote = GitRemote {
+        name: remote_name.as_str().to_owned(),
+        url: Some(url.to_owned()),
+        push_urls: push_url.map(ToOwned::to_owned).into_iter().collect(),
+        fetch_url: None,
+        push_url: None,
+        fetch_refspecs: vec![default_fetch_refspec(remote_name)],
+        push_refspecs: vec![],
+    };
 
-    if let Some(push_url) = push_url {
-        remote = remote.with_push_url(push_url)?;
-    }
-
-    let mut config = git_repo.config_snapshot().clone();
-    save_remote(&mut config, remote_name, &mut remote)?;
+    let mut config =
+        load_local_git_config(&git_repo).map_err(GitRemoteManagementError::from_git)?;
+    remote
+        .save_to(&mut config)
+        .map_err(GitRemoteManagementError::from_git)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
 
     mut_repo.ensure_remote(remote_name);
@@ -2777,13 +2923,13 @@ pub fn remove_remote(
         ));
     }
 
-    let mut config = git_repo.config_snapshot().clone();
+    let mut config =
+        load_local_git_config(&git_repo).map_err(GitRemoteManagementError::from_git)?;
     remove_remote_git_branch_config_sections(&mut config, remote_name)?;
     remove_remote_git_config_sections(&mut config, remote_name)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
 
-    let git_backend = get_git_backend(mut_repo.store())?;
-    remove_remote_git_refs(git_backend.grit_repo(), remote_name)
+    remove_remote_git_refs(&git_repo, remote_name)
         .map_err(GitRemoteManagementError::InternalError)?;
 
     if remote_name != REMOTE_NAME_FOR_LOCAL_GIT_REPO {
@@ -2847,12 +2993,10 @@ pub fn rename_remote(
     }
 
     match (
-        remote.refspecs(gix::remote::Direction::Fetch),
-        remote.refspecs(gix::remote::Direction::Push),
+        remote.fetch_refspecs.as_slice(),
+        remote.push_refspecs.as_slice(),
     ) {
-        ([refspec], [])
-            if refspec.to_ref().to_bstring()
-                == default_fetch_refspec(old_remote_name).as_bytes() => {}
+        ([refspec], []) if *refspec == default_fetch_refspec(old_remote_name) => {}
         _ => {
             return Err(GitRemoteManagementError::NonstandardConfiguration(
                 old_remote_name.to_owned(),
@@ -2860,15 +3004,14 @@ pub fn rename_remote(
         }
     }
 
-    remote
-        .replace_refspecs(
-            [default_fetch_refspec(new_remote_name).as_bytes()],
-            gix::remote::Direction::Fetch,
-        )
-        .expect("default refspec to be valid");
+    remote.name = new_remote_name.as_str().to_owned();
+    remote.fetch_refspecs = vec![default_fetch_refspec(new_remote_name)];
 
-    let mut config = git_repo.config_snapshot().clone();
-    save_remote(&mut config, new_remote_name, &mut remote)?;
+    let mut config =
+        load_local_git_config(&git_repo).map_err(GitRemoteManagementError::from_git)?;
+    remote
+        .save_to(&mut config)
+        .map_err(GitRemoteManagementError::from_git)?;
     rename_remote_in_git_branch_config_sections(&mut config, old_remote_name, new_remote_name)?;
     remove_remote_git_config_sections(&mut config, old_remote_name)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
@@ -2892,7 +3035,7 @@ fn rename_remote_git_refs(
     old_remote_name: &RemoteName,
     new_remote_name: &RemoteName,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let git_repo = git_backend.grit_repo();
+    let git_repo = git_backend.git_repo();
     let ref_log_message = format!(
         "renamed remote {old_remote_name} to {new_remote_name}",
         old_remote_name = old_remote_name.as_symbol(),
@@ -2940,23 +3083,35 @@ pub fn set_remote_urls(
 
     validate_remote_name(remote_name)?;
 
-    let Some(result) = git_repo.try_find_remote_without_url_rewrite(remote_name.as_str()) else {
+    let config = git_repo
+        .config()
+        .map_err(GitRemoteManagementError::from_git)?;
+    let section_prefix = format!("remote.{}.", remote_name.as_str());
+    if !config
+        .entries()
+        .iter()
+        .any(|entry| entry.key.starts_with(&section_prefix))
+    {
         return Err(GitRemoteManagementError::NoSuchRemote(
             remote_name.to_owned(),
         ));
-    };
-    let mut remote = result?;
+    }
+    let mut remote = GitRemote::load(&git_repo, remote_name.as_str())
+        .map_err(GitRemoteManagementError::from_git)?;
 
     if let Some(url) = new_url {
-        remote = remote.with_url(url)?;
+        remote.url = Some(url.to_owned());
     }
 
     if let Some(url) = new_push_url {
-        remote = remote.with_push_url(url)?;
+        remote.push_urls = vec![url.to_owned()];
     }
 
-    let mut config = git_repo.config_snapshot().clone();
-    save_remote(&mut config, remote_name, &mut remote)?;
+    let mut config =
+        load_local_git_config(&git_repo).map_err(GitRemoteManagementError::from_git)?;
+    remote
+        .save_to(&mut config)
+        .map_err(GitRemoteManagementError::from_git)?;
     save_git_config(&config).map_err(GitRemoteManagementError::GitConfigSaveError)?;
 
     Ok(())
@@ -3016,7 +3171,10 @@ pub enum GitDefaultRefspecError {
     #[error("No git remote named '{}'", .0.as_symbol())]
     NoSuchRemote(RemoteNameBuf),
     #[error("Invalid configuration for remote `{}`", .0.as_symbol())]
-    InvalidRemoteConfiguration(RemoteNameBuf, #[source] gix::Error),
+    InvalidRemoteConfiguration(
+        RemoteNameBuf,
+        #[source] Box<dyn std::error::Error + Send + Sync>,
+    ),
 }
 
 struct FetchedRefs {
@@ -3248,21 +3406,31 @@ enum FetchRefSpecKind {
 /// Loads the remote's fetch branch or bookmark patterns from Git config.
 pub fn load_default_fetch_bookmarks(
     remote_name: &RemoteName,
-    git_repo: &gix::Repository,
+    git_repo: &GritRepository,
 ) -> Result<(IgnoredRefspecs, StringExpression), GitDefaultRefspecError> {
-    let remote = try_find_active_remote_inner(git_repo, remote_name)
-        .ok_or_else(|| GitDefaultRefspecError::NoSuchRemote(remote_name.to_owned()))?
+    let remote = try_find_active_remote(git_repo, remote_name)
         .map_err(|e| {
-            GitDefaultRefspecError::InvalidRemoteConfiguration(remote_name.to_owned(), e)
-        })?;
+            GitDefaultRefspecError::InvalidRemoteConfiguration(remote_name.to_owned(), e.into())
+        })?
+        .ok_or_else(|| GitDefaultRefspecError::NoSuchRemote(remote_name.to_owned()))?;
 
-    let remote_refspecs = remote.refspecs(gix::remote::Direction::Fetch);
+    let mut remote_refspecs: Vec<_> = remote
+        .fetch_refspecs()
+        .iter()
+        .map(|refspec| parse_fetch_refspec_instruction(refspec))
+        .try_collect()
+        .map_err(|err| {
+            GitDefaultRefspecError::InvalidRemoteConfiguration(remote_name.to_owned(), err.into())
+        })?;
+    // Process refspecs in a stable order, without duplicates.
+    remote_refspecs.sort();
+    remote_refspecs.dedup();
     let mut ignored_refspecs = Vec::with_capacity(remote_refspecs.len());
     let mut positive_bookmarks = Vec::with_capacity(remote_refspecs.len());
     let mut negative_bookmarks = Vec::new();
-    for refspec in remote_refspecs {
-        let refspec = refspec.to_ref();
-        match parse_fetch_refspec(remote_name, refspec) {
+    for parsed in remote_refspecs {
+        let refspec = parsed.to_string();
+        match parse_fetch_refspec(remote_name, parsed) {
             Ok((FetchRefSpecKind::Positive, bookmark)) => {
                 positive_bookmarks.push(StringExpression::pattern(bookmark));
             }
@@ -3270,7 +3438,7 @@ pub fn load_default_fetch_bookmarks(
                 negative_bookmarks.push(StringExpression::pattern(bookmark));
             }
             Err(reason) => {
-                let refspec = refspec.to_bstring();
+                let refspec = refspec.into();
                 ignored_refspecs.push(IgnoredRefspec { refspec, reason });
             }
         }
@@ -3286,30 +3454,116 @@ pub fn load_default_fetch_bookmarks(
     Ok((IgnoredRefspecs(ignored_refspecs), bookmark_expr))
 }
 
-fn parse_fetch_refspec(
-    remote_name: &RemoteName,
-    refspec: gix::refspec::RefSpecRef<'_>,
-) -> Result<(FetchRefSpecKind, StringPattern), &'static str> {
-    let ensure_utf8 = |s| str::from_utf8(s).map_err(|_| "invalid UTF-8");
+/// A parsed fetch refspec.
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FetchRefspecInstruction<'a> {
+    /// Fetch `src` without updating a local ref.
+    Only { src: &'a str },
+    /// Don't fetch refs matching `src`.
+    Exclude { src: &'a str },
+    /// Fetch `src` and update `dst`.
+    AndUpdate {
+        src: &'a str,
+        dst: &'a str,
+        allow_non_fast_forward: bool,
+    },
+}
 
-    let (src, positive_dst) = match refspec.instruction() {
-        Instruction::Push(_) => panic!("push refspec should be filtered out by caller"),
-        Instruction::Fetch(fetch) => match fetch {
-            gix::refspec::instruction::Fetch::Only { src: _ } => {
-                return Err("fetch-only refspecs are not supported");
-            }
-            gix::refspec::instruction::Fetch::AndUpdate {
+impl std::fmt::Display for FetchRefspecInstruction<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Only { src } => write!(f, "{src}"),
+            Self::Exclude { src } => write!(f, "^{src}"),
+            Self::AndUpdate {
                 src,
                 dst,
                 allow_non_fast_forward,
             } => {
-                if !allow_non_fast_forward {
-                    return Err("non-forced refspecs are not supported");
-                }
-                (ensure_utf8(src)?, Some(ensure_utf8(dst)?))
+                let force = if *allow_non_fast_forward { "+" } else { "" };
+                write!(f, "{force}{src}:{dst}")
             }
-            gix::refspec::instruction::Fetch::Exclude { src } => (ensure_utf8(src)?, None),
+        }
+    }
+}
+
+/// Parses a fetch refspec as written in Git config.
+fn parse_fetch_refspec_instruction(refspec: &str) -> Result<FetchRefspecInstruction<'_>, String> {
+    let invalid = || format!("Invalid fetch refspec: {refspec}");
+    if let Some(src) = refspec.strip_prefix('^') {
+        if src.is_empty() || src.contains(':') {
+            return Err(invalid());
+        }
+        return Ok(FetchRefspecInstruction::Exclude { src });
+    }
+    let (allow_non_fast_forward, spec) = match refspec.strip_prefix('+') {
+        Some(spec) => (true, spec),
+        None => (false, refspec),
+    };
+    let instruction = match spec.split_once(':') {
+        None => FetchRefspecInstruction::Only { src: spec },
+        Some((src, "")) => FetchRefspecInstruction::Only { src },
+        Some((src, dst)) => FetchRefspecInstruction::AndUpdate {
+            src,
+            dst,
+            allow_non_fast_forward,
         },
+    };
+    // Each side must be a valid ref name, except that it may contain one '*'.
+    // Patterns must appear on both sides.
+    let validate = |name: &str| -> Result<(), String> {
+        if name.matches('*').count() > 1 {
+            return Err(format!(
+                "{}: refspec patterns may only contain a single '*' character",
+                invalid()
+            ));
+        }
+        let name = name.replace('*', "x");
+        let full_name = if name.starts_with("refs/") {
+            name
+        } else {
+            format!("refs/heads/{name}")
+        };
+        grit_lib::refs::store::RefName::try_from(&full_name)
+            .map(|_| ())
+            .map_err(|err| format!("{}: {err}", invalid()))
+    };
+    match &instruction {
+        FetchRefspecInstruction::AndUpdate { src, dst, .. } => {
+            validate(src)?;
+            validate(dst)?;
+            if src.contains('*') != dst.contains('*') {
+                return Err(format!(
+                    "{}: patterns must be used on both sides",
+                    invalid()
+                ));
+            }
+        }
+        FetchRefspecInstruction::Only { src } | FetchRefspecInstruction::Exclude { src } => {
+            validate(src)?;
+        }
+    }
+    Ok(instruction)
+}
+
+fn parse_fetch_refspec(
+    remote_name: &RemoteName,
+    refspec: FetchRefspecInstruction<'_>,
+) -> Result<(FetchRefSpecKind, StringPattern), &'static str> {
+    let (src, positive_dst) = match refspec {
+        FetchRefspecInstruction::Only { src: _ } => {
+            return Err("fetch-only refspecs are not supported");
+        }
+        FetchRefspecInstruction::AndUpdate {
+            src,
+            dst,
+            allow_non_fast_forward,
+        } => {
+            if !allow_non_fast_forward {
+                return Err("non-forced refspecs are not supported");
+            }
+            (src, Some(dst))
+        }
+        FetchRefspecInstruction::Exclude { src } => (src, None),
     };
 
     let src_branch = src
@@ -3337,8 +3591,7 @@ fn parse_fetch_refspec(
 /// Helper struct to execute multiple `git fetch` operations
 pub struct GitFetch<'a> {
     mut_repo: &'a mut MutableRepo,
-    git_repo: Box<gix::Repository>,
-    grit_repo: GritRepository,
+    git_repo: GritRepository,
     git_ctx: GitSubprocessContext,
     import_options: &'a GitImportOptions,
     fetched: Vec<FetchedRefs>,
@@ -3351,15 +3604,13 @@ impl<'a> GitFetch<'a> {
         import_options: &'a GitImportOptions,
     ) -> Result<Self, UnexpectedGitBackendError> {
         let git_backend = get_git_backend(mut_repo.store())?;
-        let git_repo = Box::new(git_backend.git_repo());
-        let grit_repo = git_backend
-            .reopen_grit_repo()
+        let git_repo = git_backend
+            .reopen_git_repo()
             .expect("Git repository should still be readable");
         let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
         Ok(GitFetch {
             mut_repo,
             git_repo,
-            grit_repo,
             git_ctx,
             import_options,
             fetched: vec![],
@@ -3416,14 +3667,14 @@ impl<'a> GitFetch<'a> {
                 remaining_refspecs.extract_if(.., |r| r.source.as_ref() == Some(&failing_refspec))
             {
                 // Even with --prune, an explicit ref won't be deleted during fetch.
-                if let Some(target) = find_ref(&self.grit_repo, &refspec.destination)
+                if let Some(target) = find_ref(&self.git_repo, &refspec.destination)
                     .map_err(|err| GitFetchError::FailedToPrune(err.into()))?
                 {
                     let git_ref = GitRef {
                         name: refspec.destination.clone(),
                         target,
                     };
-                    edit_refs(&self.grit_repo, [remove_ref(git_ref)])
+                    edit_refs(&self.git_repo, [remove_ref(git_ref)])
                         .map_err(|err| GitFetchError::FailedToPrune(err.into()))?;
                 }
             }
@@ -3468,7 +3719,7 @@ impl<'a> GitFetch<'a> {
     pub async fn import_refs(&mut self) -> Result<GitImportStats, GitImportError> {
         tracing::debug!("import_refs");
         let refs_to_import =
-            diff_fetched_refs_to_import(self.mut_repo.view(), &self.grit_repo, |kind, symbol| {
+            diff_fetched_refs_to_import(self.mut_repo.view(), &self.git_repo, |kind, symbol| {
                 match kind {
                     GitRefKind::Bookmark => self
                         .fetched
@@ -3541,7 +3792,7 @@ pub fn push_refs(
     validate_remote_name(remote)?;
 
     let git_repo = get_git_backend(mut_repo.store())?
-        .reopen_grit_repo()
+        .reopen_git_repo()
         .map_err(|err| GitPushError::UnexpectedGitError(err.into()))?;
     let to_tag_target = |name: &RefName, remote: &RemoteName, id: &CommitId| {
         let remote_matcher = StringMatcher::exact(remote);
@@ -3664,7 +3915,7 @@ pub fn push_updates(
     }
 
     let git_backend = get_git_backend(repo.store())?;
-    let git_repo = git_backend.git_repo();
+    let git_repo = get_git_repo(repo.store())?;
     let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
 
     // check the remote exists

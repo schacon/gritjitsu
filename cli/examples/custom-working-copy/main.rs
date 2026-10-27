@@ -73,7 +73,7 @@ async fn run_custom_command(
                 let backend: Box<dyn Backend> = Box::new(GitBackend::init_internal(
                     settings,
                     store_path,
-                    gix::hash::Kind::default(),
+                    grit_lib::objects::HashAlgo::default(),
                 )?);
                 Ok(backend)
             };

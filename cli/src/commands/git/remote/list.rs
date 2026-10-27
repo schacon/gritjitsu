@@ -14,10 +14,7 @@
 
 use std::io::Write as _;
 
-use bstr::BString;
-use gix::Remote;
 use jj_lib::git;
-use jj_lib::ref_name::RemoteName;
 use jj_lib::repo::Repo as _;
 
 use crate::cli_util::CommandHelper;
@@ -35,15 +32,12 @@ pub async fn cmd_git_remote_list(
 ) -> Result<(), CommandError> {
     let workspace_command = command.workspace_helper(ui).await?;
     let git_repo = git::get_git_repo(workspace_command.repo().store())?;
-    for remote_name in git_repo.remote_names() {
-        let Ok(remote_name) = str::from_utf8(&remote_name).map(RemoteName::new) else {
-            continue; // ignore non-UTF-8 remote names which we don't support
-        };
-        let Some(remote) = git::try_find_active_remote(&git_repo, remote_name)? else {
+    for remote_name in git::get_all_remote_names(workspace_command.repo().store())? {
+        let Some(remote) = git::try_find_active_remote(&git_repo, &remote_name)? else {
             continue; // ignore empty [remote "<name>"] section
         };
-        let fetch_url = get_url(&remote, gix::remote::Direction::Fetch);
-        let push_url = get_url(&remote, gix::remote::Direction::Push);
+        let fetch_url = remote.fetch_url().unwrap_or("<no URL>");
+        let push_url = remote.push_url().unwrap_or("<no URL>");
         if fetch_url == push_url {
             writeln!(
                 ui.stdout(),
@@ -59,11 +53,4 @@ pub async fn cmd_git_remote_list(
         }
     }
     Ok(())
-}
-
-fn get_url(remote: &Remote, direction: gix::remote::Direction) -> BString {
-    remote
-        .url(direction)
-        .map(|url| url.to_bstring())
-        .unwrap_or_else(|| "<no URL>".into())
 }

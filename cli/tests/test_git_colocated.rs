@@ -311,24 +311,7 @@ fn test_git_colocated_unborn_bookmark() -> TestResult {
     };
 
     // checkout index (i.e., drop the in-memory changes)
-    let checkout_index = || {
-        let mut index = git_repo.open_index().unwrap();
-        let objects = git_repo.objects.clone();
-        gix::worktree::state::checkout(
-            &mut index,
-            git_repo.workdir().unwrap(),
-            objects,
-            &gix::progress::Discard,
-            &gix::progress::Discard,
-            &gix::interrupt::IS_INTERRUPTED,
-            gix::worktree::state::checkout::Options::new(gix::filter::plumbing::Pipeline::new(
-                Default::default(),
-                git_repo.object_hash(),
-                Default::default(),
-            )),
-        )
-        .unwrap();
-    };
+    let checkout_index = || git::checkout_index(&git_repo);
 
     // Initially, HEAD isn't set.
     work_dir
@@ -557,12 +540,11 @@ fn test_git_colocated_rebase_on_import() -> TestResult {
         .peel_to_commit()?
         .parent_ids()
         .next()
-        .unwrap()
-        .detach();
+        .unwrap();
     git_repo.reference(
         "refs/heads/master",
         parent_commit,
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "update ref",
     )?;
     insta::assert_snapshot!(get_log_output(&work_dir), @"
@@ -673,8 +655,8 @@ fn test_git_colocated_bookmarks() -> TestResult {
         .into_raw();
     git_repo.reference(
         "refs/heads/master",
-        gix::ObjectId::from_hex(target_id.as_bytes()).unwrap(),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::ObjectId::from_hex(&target_id).unwrap(),
+        testutils::git::PreviousValue::Any,
         "test",
     )?;
     insta::assert_snapshot!(get_log_output(&work_dir), @"
@@ -827,8 +809,8 @@ fn test_git_colocated_explicit_import_export() -> TestResult {
         .into_raw();
     git_repo.reference(
         "refs/remotes/git/bar",
-        gix::ObjectId::from_hex(target_id.as_bytes()).unwrap(),
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::ObjectId::from_hex(&target_id).unwrap(),
+        testutils::git::PreviousValue::Any,
         "",
     )?;
 
@@ -1070,10 +1052,7 @@ fn test_git_colocated_external_checkout() -> TestResult {
     let work_dir = test_env.work_dir("repo");
     let git_repo = git::open(work_dir.root());
     let git_check_out_ref = |name| -> TestResult {
-        let target = git_repo
-            .find_reference(name)?
-            .into_fully_peeled_id()?
-            .detach();
+        let target = git_repo.find_reference(name)?.into_fully_peeled_id()?;
         git::set_head_to_id(&git_repo, target);
         Ok(())
     };
@@ -1807,50 +1786,52 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
 }
 
 fn update_git_index(repo_path: &Path) {
-    let mut iter = git::open(repo_path)
-        .status(gix::progress::Discard)
-        .unwrap()
-        .into_index_worktree_iter(None)
-        .unwrap();
-
-    // need to explicitly iterate over the changes to recreate the index
-
-    for item in iter.by_ref() {
-        item.unwrap();
-    }
-
-    iter.outcome_mut()
-        .unwrap()
-        .write_changes()
-        .unwrap()
-        .unwrap();
+    // Like `git status`, computing the status refreshes the stat information
+    // in the index.
+    git::status(&git::open(repo_path));
 }
 
 fn get_index_state(repo_path: &Path) -> String {
-    let git_repo = gix::open(repo_path).expect("git repo should exist");
+    let git_repo = git::open(repo_path);
     let mut buffer = String::new();
     // We can't use the real time from disk, since it would change each time the
     // tests are run. Instead, we just show whether it's zero or nonzero.
-    let format_time = |time: gix::index::entry::stat::Time| {
-        if time.secs == 0 && time.nsecs == 0 {
+    let format_time = |secs: u32, nsecs: u32| {
+        if secs == 0 && nsecs == 0 {
             "0:0"
         } else {
             "[nonzero]"
         }
     };
-    let index = git_repo.index_or_empty().unwrap();
+    let index = git_repo.index_handle().load().unwrap();
     for entry in index.entries() {
+        let stage = git::index_stage_name(entry.stage());
+        let mode = git::index_mode_name(entry.mode);
+        // Flags in the in-memory layout gitoxide used to report.
+        let mut flags = u32::from(entry.flags & 0x3000);
+        if entry.flags & 0x8000 != 0 {
+            flags |= 0x8000;
+        }
+        if entry.flags_extended.is_some_and(|fe| fe != 0) {
+            flags |= 0x4000;
+        }
+        if entry.intent_to_add() {
+            flags |= 1 << 29;
+        }
+        if entry.skip_worktree() {
+            flags |= 1 << 30;
+        }
         writeln!(
             &mut buffer,
-            "{:12} {:?} {} ctime={} mtime={} size={} flags={:x} {}",
-            format!("{:?}", entry.stage()),
-            entry.mode,
-            entry.id.to_hex_with_len(12),
-            format_time(entry.stat.ctime),
-            format_time(entry.stat.mtime),
-            entry.stat.size,
-            entry.flags.bits(),
-            entry.path_in(index.path_backing()),
+            "{:12} {} {} ctime={} mtime={} size={} flags={:x} {}",
+            stage,
+            mode,
+            &entry.oid.to_hex()[..12],
+            format_time(entry.ctime_sec, entry.ctime_nsec),
+            format_time(entry.mtime_sec, entry.mtime_nsec),
+            entry.size,
+            flags,
+            str::from_utf8(&entry.path).unwrap(),
         )
         .unwrap();
     }

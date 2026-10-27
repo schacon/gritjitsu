@@ -329,7 +329,7 @@ async fn init_workspace(
     wc_path: &Path,
     workspace_name: &WorkspaceName,
     colocate: bool,
-    object_hash: gix::hash::Kind,
+    object_hash: grit_lib::objects::HashAlgo,
 ) -> Result<(WorkspaceCommandHelper, ConfigEnv), CommandError> {
     let (settings, config_env) = command.settings_for_new_workspace(ui, wc_path)?;
     let (workspace, repo) = if colocate {
@@ -353,8 +353,8 @@ async fn configure_remote(
     git::add_remote(tx.repo_mut(), remote_name, source, None)?;
     tx.finish(ui, format!("add git remote {}", remote_name.as_symbol()))
         .await?;
-    // Reload workspace to apply new remote configuration to
-    // gix::ThreadSafeRepository behind the store.
+    // Reload workspace to apply new remote configuration to the Git
+    // repository behind the store.
     let workspace = command.load_workspace_at(
         workspace_command.workspace_root(),
         workspace_command.settings(),

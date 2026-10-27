@@ -88,3 +88,18 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
   entries) is built and written with grit-lib's `Index`. Resolved parent trees
   are read straight from the Git tree, and stat data is carried over from the
   old index for unchanged entries. Tests: 3491/3491.
+- **Steps 7–10**: gitoxide is gone (`cargo tree` and `Cargo.lock` have no
+  `gix*`). Remote config (add/remove/rename/set-url, refspecs, URL rewrites),
+  repository init, the CLI (URL parsing, `remote list`, gerrit, excludes file,
+  colocation) and the test helpers all use grit-lib. `testutils::git` now
+  wraps a grit `Repository` with small helpers similar to the old gix calls.
+  `GitBackend::git_repo()` returns `&grit_lib::repo::Repository`.
+  Behavior notes:
+  - jj infers the work tree of a non-bare `.git` dir and follows `.git`
+    files, as gix did. grit's `open` doesn't infer either.
+  - New repos get `hooks/` and `info/exclude` like Git's default template.
+    grit's init omits them.
+  - The internal repo's config lists `repositoryformatversion` first and omits
+    the default `logallrefupdates = false` (grit's init layout). Snapshots of
+    `.git/config` and some library error messages changed accordingly.
+  Tests: 3491/3491.

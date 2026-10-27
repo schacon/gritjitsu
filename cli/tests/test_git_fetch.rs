@@ -23,13 +23,17 @@ use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::create_commit;
 
-fn add_commit_to_branch(git_repo: &gix::Repository, branch: &str, message: &str) -> gix::ObjectId {
+fn add_commit_to_branch(
+    git_repo: &testutils::git::Repository,
+    branch: &str,
+    message: &str,
+) -> testutils::git::ObjectId {
     // Get current commit ID of the branch if it exists
     let parents = git_repo
         .find_reference(&format!("refs/heads/{branch}"))
         .ok()
-        .and_then(|mut r| r.peel_to_commit().ok())
-        .map(|c| vec![c.id().detach()])
+        .and_then(|r| r.peel_to_commit().ok())
+        .map(|c| vec![c.id()])
         .unwrap_or_default();
 
     git::add_commit(
@@ -44,7 +48,7 @@ fn add_commit_to_branch(git_repo: &gix::Repository, branch: &str, message: &str)
 }
 
 /// Creates a remote Git repo containing a bookmark with the same name
-fn init_git_remote(test_env: &TestEnvironment, remote: &str) -> gix::Repository {
+fn init_git_remote(test_env: &TestEnvironment, remote: &str) -> testutils::git::Repository {
     let git_repo_path = test_env.env_root().join(remote);
     let git_repo = git::init(git_repo_path);
     add_commit_to_branch(&git_repo, remote, "message");
@@ -57,7 +61,7 @@ fn add_git_remote(
     test_env: &TestEnvironment,
     work_dir: &TestWorkDir,
     remote: &str,
-) -> gix::Repository {
+) -> testutils::git::Repository {
     let repo = init_git_remote(test_env, remote);
     work_dir
         .run_jj(["git", "remote", "add", remote, &format!("../{remote}")])
@@ -94,7 +98,7 @@ fn clone_git_remote_into(
     test_env: &TestEnvironment,
     upstream: &str,
     fork: &str,
-) -> gix::Repository {
+) -> testutils::git::Repository {
     let upstream_path = test_env.env_root().join(upstream);
     let fork_path = test_env.env_root().join(fork);
     let fork_repo = git::clone(&fork_path, upstream_path.to_str().unwrap(), Some(upstream));
@@ -104,14 +108,13 @@ fn clone_git_remote_into(
         .find_reference(&format!("refs/remotes/{upstream}/{upstream}"))
         .unwrap()
         .peel_to_id()
-        .unwrap()
-        .detach();
+        .unwrap();
 
     fork_repo
         .reference(
             format!("refs/heads/{upstream}"),
             upstream_head,
-            gix::refs::transaction::PreviousValue::MustNotExist,
+            testutils::git::PreviousValue::MustNotExist,
             "create tracking head",
         )
         .unwrap();
@@ -728,13 +731,13 @@ fn test_git_fetch_prune_before_updating_tips() -> TestResult {
     ");
 
     // Remove origin bookmark in git repo and create origin/subname
-    let mut origin_reference = git_repo.find_reference("refs/heads/origin")?;
-    let commit_id = origin_reference.peel_to_commit()?.id().detach();
+    let origin_reference = git_repo.find_reference("refs/heads/origin")?;
+    let commit_id = origin_reference.peel_to_commit()?.id();
     origin_reference.delete()?;
     git_repo.reference(
         "refs/heads/origin/subname",
         commit_id,
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        testutils::git::PreviousValue::MustNotExist,
         "create new reference",
     )?;
 
@@ -825,12 +828,9 @@ fn test_git_fetch_tags_by_name() -> TestResult {
 
     // Create remote branches and tags
     let origin_git_repo = add_git_remote(&test_env, &work_dir, "origin");
-    let commit1_oid = origin_git_repo
-        .find_reference("refs/heads/origin")?
-        .id()
-        .detach();
+    let commit1_oid = origin_git_repo.find_reference("refs/heads/origin")?.id();
     for name in ["tag1", "tag2", "tag3"] {
-        let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+        let constraint = testutils::git::PreviousValue::MustNotExist;
         origin_git_repo.tag_reference(name, commit1_oid, constraint)?;
     }
 
@@ -883,7 +883,7 @@ fn test_git_fetch_tags_by_name() -> TestResult {
 
     // Move and delete tags at remote
     let commit2_oid = add_commit_to_branch(&origin_git_repo, "origin", "commit 2");
-    let constraint = gix::refs::transaction::PreviousValue::MustExistAndMatch(commit1_oid.into());
+    let constraint = testutils::git::PreviousValue::MustExistAndMatch(commit1_oid.into());
     origin_git_repo.tag_reference("tag1", commit2_oid, constraint)?;
     origin_git_repo.find_reference("refs/tags/tag2")?.delete()?;
 
@@ -2078,19 +2078,17 @@ fn test_git_fetch_preserve_commits_across_repos() -> TestResult {
     let base_id = upstream_repo
         .find_reference("refs/heads/upstream")?
         .peel_to_commit()?
-        .id()
-        .detach();
+        .id();
 
     let fork_id = upstream_repo
         .find_reference("refs/remotes/fork/feature")?
         .peel_to_commit()?
-        .id()
-        .detach();
+        .id();
 
     git::write_commit(
         &upstream_repo,
         "refs/heads/upstream",
-        upstream_repo.empty_tree().id().detach(),
+        upstream_repo.empty_tree().id(),
         "merge",
         &[base_id, fork_id],
     );

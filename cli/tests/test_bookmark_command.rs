@@ -20,7 +20,7 @@ use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 
 fn create_commit_with_refs(
-    repo: &gix::Repository,
+    repo: &testutils::git::Repository,
     message: &str,
     content: &[u8],
     ref_names: &[&str],
@@ -35,7 +35,7 @@ fn create_commit_with_refs(
         repo.reference(
             *name,
             commit_id,
-            gix::refs::transaction::PreviousValue::Any,
+            testutils::git::PreviousValue::Any,
             "log message",
         )
         .unwrap();
@@ -1181,10 +1181,11 @@ fn test_bookmark_delete_glob() -> TestResult {
     let git_repo_path = test_env.env_root().join("git-repo");
     let git_repo = git::init_bare(git_repo_path);
     let blob_oid = git_repo.write_blob(b"content")?;
-    let mut tree_editor =
-        git_repo.edit_tree(gix::ObjectId::empty_tree(gix::hash::Kind::default()))?;
-    tree_editor.upsert("file", gix::object::tree::EntryKind::Blob, blob_oid)?;
-    let _tree_id = tree_editor.write()?;
+    let _tree_id = git_repo.write_tree(vec![git::TreeEntry {
+        mode: 0o100644,
+        name: b"file".to_vec(),
+        oid: blob_oid,
+    }])?;
     work_dir
         .run_jj(["git", "remote", "add", "origin", "../git-repo"])
         .success();

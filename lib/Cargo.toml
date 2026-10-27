@@ -33,7 +33,6 @@ digest = { workspace = true }
 dunce = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
-gix = { workspace = true, optional = true }
 grit-lib = { workspace = true }
 globset = { workspace = true }
 indexmap = { workspace = true }
@@ -83,7 +82,7 @@ nix = { workspace = true, features = [ "fs" ] }
 
 [features]
 default = ["git"]
-git = ["dep:gix"]
+git = []
 watchman = ["dep:watchman_client", "dep:tokio"]
 testing = ["git"]
 

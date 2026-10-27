@@ -25,7 +25,7 @@ use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::to_toml_value;
 
-fn init_git_repo(git_repo_path: &Path, bare: bool) -> gix::Repository {
+fn init_git_repo(git_repo_path: &Path, bare: bool) -> testutils::git::Repository {
     let git_repo = if bare {
         git::init_bare(git_repo_path)
     } else {
@@ -286,8 +286,8 @@ fn test_git_init_external_import_trunk(bare: bool) -> TestResult {
 
     git_repo.reference(
         "refs/remotes/origin/trunk",
-        oid.detach(),
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        oid,
+        testutils::git::PreviousValue::MustNotExist,
         "create remote ref",
     )?;
 
@@ -347,8 +347,8 @@ fn test_git_init_external_import_trunk_upstream_takes_precedence() -> TestResult
     // upstream has "develop" as default
     git_repo.reference(
         "refs/remotes/upstream/develop",
-        oid.detach(),
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        oid,
+        testutils::git::PreviousValue::MustNotExist,
         "create upstream remote ref",
     )?;
 
@@ -361,8 +361,8 @@ fn test_git_init_external_import_trunk_upstream_takes_precedence() -> TestResult
     // origin has "trunk" as default
     git_repo.reference(
         "refs/remotes/origin/trunk",
-        oid.detach(),
-        gix::refs::transaction::PreviousValue::MustNotExist,
+        oid,
+        testutils::git::PreviousValue::MustNotExist,
         "create origin remote ref",
     )?;
 
@@ -429,16 +429,15 @@ fn test_git_init_external_non_existent_git_directory() {
     test_env.add_config("git.colocate = true");
     let work_dir = test_env.work_dir("repo");
     let output = test_env.run_jj_in(".", ["git", "init", "repo", "--git-repo", "repo"]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
     Error: Failed to access the repository
     Caused by:
     1: Failed to open git repository
-    2: "$TEST_ENV/repo" does not appear to be a git repository
-    3: Missing HEAD at ".git/HEAD"
+    2: not a git repository (or any of the parent directories): $TEST_ENV/repo
     [EOF]
     [exit status: 1]
-    "#);
+    ");
     let jj_path = work_dir.root().join(".jj");
     assert!(!jj_path.exists());
 }
@@ -737,7 +736,7 @@ fn test_git_init_colocated_via_git_repo_path_imported_refs() {
             .reference(
                 "refs/heads/local-remote",
                 git_ref.target().id().to_owned(),
-                gix::refs::transaction::PreviousValue::MustNotExist,
+                testutils::git::PreviousValue::MustNotExist,
                 "move local-remote bookmark",
             )
             .unwrap();
@@ -1225,28 +1224,26 @@ fn test_git_init_with_invalid_gitlink() {
     // `jj git init --colocate` first checks for a worktree, make it fail
     // subsequent errors are not specific to colocation
     let output = work_dir.run_jj(["git", "init", "--colocate"]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
     Error: Failed to access the repository
     Caused by:
     1: Failed to open git repository
-    2: "$TEST_ENV/repo/.git" does not appear to be a git repository
-    3: Format should be 'gitdir: <path>', but got, input="invalid"
+    2: not a git repository (or any of the parent directories): invalid gitfile format
     [EOF]
     [exit status: 1]
-    "#);
+    ");
 
     let output = work_dir.run_jj(["git", "init", "--git-repo", "."]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
     Error: Failed to access the repository
     Caused by:
     1: Failed to open git repository
-    2: "$TEST_ENV/repo/.git" does not appear to be a git repository
-    3: Format should be 'gitdir: <path>', but got, input="invalid"
+    2: not a git repository (or any of the parent directories): invalid gitfile format
     [EOF]
     [exit status: 1]
-    "#);
+    ");
 }
 
 #[test]

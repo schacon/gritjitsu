@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use testutils::TestResult;
 use testutils::git;
@@ -196,11 +195,11 @@ fn test_git_import_undo() -> TestResult {
         .success()
         .stdout
         .into_raw();
-    let commit_id = gix::ObjectId::from_hex(commit_id.as_bytes()).unwrap();
+    let commit_id = testutils::git::ObjectId::from_hex(&commit_id).unwrap();
     git_repo.reference(
         "refs/heads/a",
         commit_id,
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "",
     )?;
 
@@ -260,11 +259,11 @@ fn test_git_import_move_export_with_default_undo() -> TestResult {
         .success()
         .stdout
         .into_raw();
-    let commit_id = gix::ObjectId::from_hex(commit_id.as_bytes()).unwrap();
+    let commit_id = testutils::git::ObjectId::from_hex(&commit_id).unwrap();
     git_repo.reference(
         "refs/heads/a",
         commit_id,
-        gix::refs::transaction::PreviousValue::Any,
+        testutils::git::PreviousValue::Any,
         "",
     )?;
 
@@ -375,12 +374,12 @@ fn test_git_import_export_stats_color() -> TestResult {
     [EOF]
     "#);
 
-    let other_commit_id = gix::ObjectId::from_hex(other_commit_id.as_bytes()).unwrap();
+    let other_commit_id = testutils::git::ObjectId::from_hex(&other_commit_id).unwrap();
     for name in ["refs/heads/foo", "refs/heads/bar", "refs/tags/baz"] {
         git_repo.reference(
             name,
             other_commit_id,
-            gix::refs::transaction::PreviousValue::Any,
+            testutils::git::PreviousValue::Any,
             "",
         )?;
     }
@@ -403,30 +402,17 @@ fn get_bookmark_output(work_dir: &TestWorkDir) -> CommandOutput {
     work_dir.run_jj(["bookmark", "list", "--all-remotes"])
 }
 
-fn get_git_repo_refs(git_repo: &gix::Repository) -> Vec<(bstr::BString, CommitId)> {
-    let mut refs: Vec<_> = git_repo
-        .references()
-        .unwrap()
-        .all()
-        .unwrap()
-        .filter_ok(|git_ref| {
-            matches!(
-                git_ref.name().category(),
-                Some(
-                    gix::reference::Category::Tag
-                        | gix::reference::Category::LocalBranch
-                        | gix::reference::Category::RemoteBranch
-                ),
-            )
-        })
-        .filter_map_ok(|mut git_ref| {
-            let full_name = git_ref.name().as_bstr().to_owned();
+fn get_git_repo_refs(git_repo: &testutils::git::Repository) -> Vec<(bstr::BString, CommitId)> {
+    let mut refs: Vec<_> = ["refs/tags/", "refs/heads/", "refs/remotes/"]
+        .into_iter()
+        .flat_map(|prefix| git_repo.list_references(prefix).unwrap())
+        .filter_map(|git_ref| {
+            let full_name = git_ref.name().to_owned();
             let git_commit = git_ref.peel_to_commit().ok()?;
             let commit_id = CommitId::from_bytes(git_commit.id().as_bytes());
             Some((full_name, commit_id))
         })
-        .try_collect()
-        .unwrap();
+        .collect();
     refs.sort();
     refs
 }

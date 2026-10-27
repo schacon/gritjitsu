@@ -90,9 +90,8 @@ fn test_git_remotes() {
     ");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "bar"]
     	url = http://example.com/repo/bar
     	fetch = +refs/heads/*:refs/remotes/bar/*
@@ -114,11 +113,7 @@ fn test_git_remotes() {
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
     Error: Unexpected Git error when managing remotes
-    Caused by:
-    1: The fetch url under `remote.foo` was invalid, input="foo"
-    2: Could not parse URL, input="https://", key="remote.<name>.url"
-    3: URL can not be parsed as valid URL, input="https://"
-    4: Scheme requires host
+    Caused by: The URL in `remote.foo.url` is invalid: "https://": URL scheme requires a host
     [EOF]
     [exit status: 1]
     "#);
@@ -357,9 +352,8 @@ fn test_git_remote_set_url() {
     ");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = http://example.com/repo/bar
     	fetch = +refs/heads/*:refs/remotes/foo/*
@@ -376,9 +370,8 @@ fn test_git_remote_set_url() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = http://example.com/repo/bar
     	pushurl = https://example.com/repo/bar
@@ -395,9 +388,8 @@ fn test_git_remote_set_url() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = http://example.com/repo/bar
     	pushurl = git@example.com:repo/bar
@@ -414,9 +406,8 @@ fn test_git_remote_set_url() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = http://example.com/repo/bar2
     	pushurl = git@example.com:repo/bar
@@ -432,9 +423,8 @@ fn test_git_remote_set_url() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = http://example.com/repo/bar
     	pushurl = git@example.com:repo/bar
@@ -471,9 +461,8 @@ fn test_git_remote_set_url() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = https://example.com/repo/baz
     	pushurl = git@example.com:/repo/baz
@@ -492,9 +481,8 @@ fn test_git_remote_set_url() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "foo"]
     	url = https://example.com/repo/bar
     	pushurl = git@example.com:/repo/bar
@@ -576,9 +564,8 @@ fn test_git_remote_rename() {
     ");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "baz"]
     	url = http://example.com/repo/baz
     	fetch = +refs/heads/*:refs/remotes/baz/*
@@ -797,9 +784,9 @@ fn test_git_remote_named_git() {
     ");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
+    	repositoryformatversion = 0
     	bare = false
     	logallrefupdates = true
-    	repositoryformatversion = 0
     [remote "bar"]
     	url = http://example.com/repo/repo
     	fetch = +refs/heads/*:refs/remotes/bar/*
@@ -828,9 +815,9 @@ fn test_git_remote_named_git() {
     work_dir.run_jj(["git", "init", "--git-repo=."]).success();
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
+    	repositoryformatversion = 0
     	bare = false
     	logallrefupdates = true
-    	repositoryformatversion = 0
     [remote "git"]
     	url = http://example.com/repo/repo
     	fetch = +refs/heads/*:refs/remotes/git/*
@@ -843,9 +830,9 @@ fn test_git_remote_named_git() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @"
     [core]
+    	repositoryformatversion = 0
     	bare = false
     	logallrefupdates = true
-    	repositoryformatversion = 0
     ");
     // @git bookmark shouldn't be removed.
     let output = work_dir.run_jj(["log", "-rmain@git", "-Tbookmarks"]);
@@ -957,9 +944,8 @@ fn test_git_remote_with_branch_config() -> TestResult {
 
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [branch "test"]
     	remote = bar
     	merge = refs/heads/test
@@ -1013,9 +999,8 @@ fn test_git_remote_with_global_git_remote_config() {
     insta::assert_snapshot!(output, @"");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "bar"]
     	url = htps://example.com/repo/foo
     	fetch = +refs/heads/*:refs/remotes/bar/*
@@ -1056,9 +1041,8 @@ fn test_git_remote_with_global_git_remote_config() {
     ");
     insta::assert_snapshot!(read_git_config(work_dir.root()), @r#"
     [core]
-    	bare = true
-    	logallrefupdates = false
     	repositoryformatversion = 0
+    	bare = true
     [remote "bar"]
     	url = htps://example.com/repo/foo
     	fetch = +refs/heads/*:refs/remotes/bar/*
@@ -1082,13 +1066,13 @@ fn test_git_remote_name_validation() {
         "my remote",
         "http://example.com/repo",
     ]);
-    insta::assert_snapshot!(output, @r#"
+    insta::assert_snapshot!(output, @"
     ------- stderr -------
     Error: Invalid Git remote name
     Caused by:
-    1: remote names must be valid within refspecs for fetching, input="my remote"
-    2: Reference name contains invalid byte: " "
+    1: remote names must be valid within refspecs for fetching: my remote
+    2: ref name contains an illegal character
     [EOF]
     [exit status: 1]
-    "#);
+    ");
 }

@@ -66,11 +66,12 @@ fn collect_no_gc_refs(git_repo_path: &Path) -> HashSet<CommitId> {
     // Load fresh git repo to isolate from false caching issue. Here we want to
     // ensure that the underlying data is correct. We could test the in-memory
     // data as well, but we don't have any special handling in our code.
-    let git_repo = gix::open(git_repo_path).unwrap();
-    let git_refs = git_repo.references().unwrap();
-    let no_gc_refs_iter = git_refs.prefixed("refs/jj/keep/").unwrap();
-    no_gc_refs_iter
-        .map(|git_ref| CommitId::from_bytes(git_ref.unwrap().id().as_bytes()))
+    let git_repo = testutils::git::open(git_repo_path);
+    git_repo
+        .list_references("refs/jj/keep/")
+        .unwrap()
+        .iter()
+        .map(|git_ref| CommitId::from_bytes(git_ref.id().as_bytes()))
         .collect()
 }
 
@@ -440,16 +441,28 @@ fn test_jj_trees_header_with_one_tree() -> TestResult {
         repo.store(),
         MergedTree::resolved(repo.store().clone(), tree_1.id().clone()),
     );
-    let git_commit_id = gix::ObjectId::from_bytes_or_panic(commit.id().as_bytes());
-    let git_commit = git_repo.find_commit(git_commit_id)?;
+    let git_commit_id = testutils::git::ObjectId::from_bytes(commit.id().as_bytes()).unwrap();
+    let git_commit = git_repo.odb().read(&git_commit_id)?.data;
+    let git_commit = str::from_utf8(&git_commit)?;
+    let (headers, message) = git_commit.split_once("\n\n").unwrap();
 
-    // Add `jj:trees` with a single tree which is different from the Git commit tree
-    let mut new_commit: gix::objs::Commit = git_commit.decode().unwrap().try_into().unwrap();
-    new_commit.extra_headers = vec![(
-        JJ_TREES_COMMIT_HEADER.into(),
-        tree_2.id().to_string().into(),
-    )];
-    let new_commit_id = git_repo.write_object(&new_commit)?;
+    // Replace the extra headers with `jj:trees` with a single tree which is
+    // different from the Git commit tree
+    let mut new_commit = headers
+        .lines()
+        .filter(|line| {
+            ["tree ", "parent ", "author ", "committer "]
+                .iter()
+                .any(|name| line.starts_with(name))
+        })
+        .join("\n");
+    new_commit.push_str(&format!(
+        "\n{JJ_TREES_COMMIT_HEADER} {}\n\n{message}",
+        tree_2.id()
+    ));
+    let new_commit_id = git_repo
+        .odb()
+        .write(testutils::git::ObjectKind::Commit, new_commit.as_bytes())?;
     let new_commit_id = CommitId::from_bytes(new_commit_id.as_bytes());
 
     // Import new commit into `jj` repo. This should fail, because allowing a
