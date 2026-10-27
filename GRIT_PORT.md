@@ -103,3 +103,17 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
     the default `logallrefupdates = false` (grit's init layout). Snapshots of
     `.git/config` and some library error messages changed accordingly.
   Tests: 3491/3491.
+
+### grit-lib changes
+
+| Change | Status |
+| --- | --- |
+| `IgnorePatternList` (standalone ignore matching) | merged: gitbutlerapp/grit#2137 |
+| Strip at most one trailing CR from ignore lines | on upstream `main` (d4988e6ca, pushed directly by mistake; see below) |
+| `detect_copies` reports source modes | open: gitbutlerapp/grit#2146 |
+| `detect_copies` only treats created paths as copy destinations | branch `detect-copies-modified-not-dest` on schacon/grit, stacked on #2146; PR after #2146 lands |
+
+Incident: creating a PR for the CR fix force-pushed upstream `main`, because
+that branch had been created from `upstream/main` and still tracked it. The
+merge it dropped (ec05183a6, `factory/revs-count-paint`) was restored by a
+regular merge push (0c5982a64). The branch's tracking config has been removed.
