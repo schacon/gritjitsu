@@ -103,6 +103,29 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
     the default `logallrefupdates = false` (grit's init layout). Snapshots of
     `.git/config` and some library error messages changed accordingly.
   Tests: 3491/3491.
+- **Steps 11–16**: no `git` subprocesses remain. `lib/src/git_transport.rs`
+  runs fetch, push, default-branch lookup and worktree add/repair/prune
+  through grit-lib, and `jj util gc` uses `grit_lib::maintenance::gc`.
+  `git.executable-path` is gone, and so is the minimum Git version.
+  `git_subprocess.rs` keeps only the error, callback and progress types, so
+  the public `GitSubprocess*` names stay the same for the CLI.
+  Behavior notes:
+  - `GitSubprocessOptions::environment` is layered over the process
+    environment when grit loads configuration, so `GIT_CONFIG_*`,
+    `GIT_ASKPASS` and similar variables still apply. `GIT_TRACE` does
+    nothing, so the env-option tests now redirect the remote with a
+    `GIT_CONFIG_*` `insteadOf` rule.
+  - Remote "Counting/Compressing objects" progress comes from sideband
+    lines; local progress comes from grit's progress sink.
+  - The default branch comes from `ls-remote` HEAD symrefs. A remote with a
+    detached HEAD falls back to `init.defaultBranch`/`master` and then the
+    first branch at HEAD's commit.
+  - Pushes don't update remote-tracking refs themselves; jj records them as
+    before.
+  Ten unit tests that parsed `git` output were removed, and the two "missing
+  git executable" clone tests became one test that clones with an empty
+  `PATH`. Test helpers and a few tests still run `git` as a reference
+  implementation; jj itself never does. Tests: 3480/3480.
 
 ### grit-lib changes
 
@@ -112,6 +135,9 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
 | Strip at most one trailing CR from ignore lines | on upstream `main` (d4988e6ca, pushed directly by mistake; see below) |
 | `detect_copies` reports source modes | open: gitbutlerapp/grit#2146 |
 | `detect_copies` only treats created paths as copy destinations | branch `detect-copies-modified-not-dest` on schacon/grit, stacked on #2146; PR after #2146 lands |
+| Local pushes run receive hooks and accept push options | open: gitbutlerapp/grit#2148 |
+| `WorktreeBranch::Orphan` (`git worktree add --orphan`); worktrees for bare repos | open: gitbutlerapp/grit#2149 |
+| `worktree prune` checks the recorded `.git` file, like Git | open: gitbutlerapp/grit#2150 |
 
 Incident: creating a PR for the CR fix force-pushed upstream `main`, because
 that branch had been created from `upstream/main` and still tracked it. The

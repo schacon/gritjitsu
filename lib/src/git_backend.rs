@@ -26,8 +26,6 @@ use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Command;
-use std::process::ExitStatus;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -180,10 +178,8 @@ pub enum GitRepoAtWorkdirError {
 
 #[derive(Debug, Error)]
 pub enum GitGcError {
-    #[error("Failed to run git gc command")]
-    GcCommand(#[source] std::io::Error),
-    #[error("git gc command exited with an error: {0}")]
-    GcCommandErrorStatus(ExitStatus),
+    #[error("Failed to run git gc")]
+    Gc(#[source] grit_lib::error::Error),
 }
 
 pub struct GitBackend {
@@ -197,7 +193,6 @@ pub struct GitBackend {
     shallow_root_ids: OnceLock<Vec<CommitId>>,
     extra_metadata_store: TableStore,
     cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
-    git_executable: PathBuf,
     write_change_id_header: bool,
     /// `Name <email>` recorded in reflog entries.
     reflog_identity: String,
@@ -226,7 +221,6 @@ impl GitBackend {
             shallow_root_ids: OnceLock::new(),
             extra_metadata_store,
             cached_extra_metadata: Mutex::new(None),
-            git_executable: git_settings.executable_path,
             write_change_id_header: git_settings.write_change_id_header,
             reflog_identity,
         }
@@ -571,14 +565,32 @@ pub fn canonicalize_git_repo_path(path: &Path) -> io::Result<PathBuf> {
 ///
 /// Like Git, a non-bare repository's work tree is `core.worktree`, or the
 /// parent directory of a `.git` directory.
-fn open_grit_repo(git_dir: &Path) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+pub(crate) fn open_grit_repo(
+    git_dir: &Path,
+) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+    open_grit_repo_in_environment(git_dir, grit_environment())
+}
+
+/// Like [`open_grit_repo()`], but with the given process environment.
+pub(crate) fn open_grit_repo_in_environment(
+    git_dir: &Path,
+    environment: grit_lib::prelude::Environment,
+) -> Result<grit_lib::repo::Repository, grit_lib::error::Error> {
+    let open = |git_dir: &Path, work_tree: Option<&Path>| {
+        let mut options =
+            grit_lib::prelude::RepositoryOptions::with_environment(environment.clone());
+        if let Some(work_tree) = work_tree {
+            options = options.with_work_tree(work_tree);
+        }
+        grit_lib::repo::Repository::open(git_dir, &options)
+    };
     // A `.git` file links to the Git directory of a worktree, or of a
     // repository stored elsewhere. Its directory is the work tree.
     if git_dir.is_file() {
         let linked_git_dir = grit_lib::repo::resolve_dot_git(git_dir)?;
-        return open_grit_repo_with_work_tree(&linked_git_dir, git_dir.parent());
+        return open(&linked_git_dir, git_dir.parent());
     }
-    let repo = open_grit_repo_with_work_tree(git_dir, None)?;
+    let repo = open(git_dir, None)?;
     let config = repo.config()?;
     let is_bare = match config.get_bool("core.bare") {
         Some(Ok(bare)) => bare,
@@ -594,7 +606,7 @@ fn open_grit_repo(git_dir: &Path) -> Result<grit_lib::repo::Repository, grit_lib
             _ => return Ok(repo),
         },
     };
-    open_grit_repo_with_work_tree(git_dir, Some(&work_tree))
+    open(git_dir, Some(&work_tree))
 }
 
 /// The process environment, as grit-lib sees it.
@@ -1215,24 +1227,14 @@ fn recreate_no_gc_refs(
     edit_references(git_repo, ref_edits)
 }
 
-fn run_git_gc(program: &OsStr, git_dir: &Path, keep_newer: SystemTime) -> Result<(), GitGcError> {
-    let keep_newer = keep_newer
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default(); // underflow
-    let mut git = Command::new(program);
-    git.arg("--git-dir=.") // turn off discovery
-        .arg("gc")
-        .arg(format!("--prune=@{} +0000", keep_newer.as_secs()));
-    // Don't specify it by GIT_DIR/--git-dir. On Windows, the path could be
-    // canonicalized as UNC path, which wouldn't be supported by git.
-    git.current_dir(git_dir);
-    // TODO: pass output to UI layer instead of printing directly here
-    tracing::info!(?git, "running git gc");
-    let status = git.status().map_err(GitGcError::GcCommand)?;
-    tracing::info!(?status, "git gc exited");
-    if !status.success() {
-        return Err(GitGcError::GcCommandErrorStatus(status));
-    }
+/// Packs refs and objects, and prunes unreachable objects older than
+/// `keep_newer`, like `git gc --prune=<keep_newer>`.
+fn run_git_gc(repo: &grit_lib::repo::Repository, keep_newer: SystemTime) -> Result<(), GitGcError> {
+    let mut options = grit_lib::maintenance::GcOptions::default();
+    options.repack.prune_older_than = Some(time::OffsetDateTime::from(keep_newer));
+    tracing::info!(?keep_newer, "running git gc");
+    let stats = grit_lib::maintenance::gc(repo, &options).map_err(GitGcError::Gc)?;
+    tracing::info!(?stats, "git gc finished");
     Ok(())
 }
 
@@ -1757,12 +1759,11 @@ impl Backend for GitBackend {
             .gc(&table, keep_newer)
             .map_err(|err| BackendError::Other(err.into()))?;
 
-        run_git_gc(
-            self.git_executable.as_ref(),
-            self.git_repo_path(),
-            keep_newer,
-        )
-        .map_err(|err| BackendError::Other(err.into()))?;
+        // Reload to see the refs and packs written since the backend was loaded.
+        let repo = self
+            .reopen_git_repo()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        run_git_gc(&repo, keep_newer).map_err(|err| BackendError::Other(err.into()))?;
         Ok(())
     }
 }
@@ -1874,6 +1875,7 @@ fn write_tree_entries(
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
+    use std::process::Command;
 
     use indoc::indoc;
     use test_case::test_case;

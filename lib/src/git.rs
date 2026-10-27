@@ -35,7 +35,6 @@ use std::ffi::OsString;
 use std::iter;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use bstr::BString;
@@ -146,7 +145,6 @@ const INDEX_DUMMY_CONFLICT_FILE: &str = ".jj-do-not-resolve-this-conflict";
 #[derive(Clone, Debug)]
 pub struct GitSettings {
     pub abandon_unreachable_commits: bool,
-    pub executable_path: PathBuf,
     pub record_synthetic_predecessors: bool,
     pub write_change_id_header: bool,
 }
@@ -155,7 +153,6 @@ impl GitSettings {
     pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
         Ok(Self {
             abandon_unreachable_commits: settings.get_bool("git.abandon-unreachable-commits")?,
-            executable_path: settings.get("git.executable-path")?,
             record_synthetic_predecessors: settings
                 .get_bool("git.record-synthetic-predecessors")?,
             write_change_id_header: settings.get("git.write-change-id-header")?,
@@ -163,30 +160,25 @@ impl GitSettings {
     }
 
     pub fn to_subprocess_options(&self) -> GitSubprocessOptions {
-        GitSubprocessOptions {
-            executable_path: self.executable_path.clone(),
-            environment: HashMap::new(),
-        }
+        GitSubprocessOptions::default()
     }
 }
 
-/// Configuration for a Git subprocess
-#[derive(Clone, Debug)]
+/// Configuration for Git remote and worktree operations
+#[derive(Clone, Debug, Default)]
 pub struct GitSubprocessOptions {
-    pub executable_path: PathBuf,
     /// Used by consumers of jj-lib to set environment variables like
-    /// GIT_ASKPASS (for authentication callbacks) or GIT_TRACE (for debugging).
-    /// Setting per-subcommand environment variables avoids the need for unsafe
-    /// code and process-wide state.
+    /// GIT_ASKPASS (for authentication callbacks) or GIT_CONFIG_* (for extra
+    /// configuration). They're layered over the process environment when Git
+    /// is configured, which avoids the need for unsafe code and process-wide
+    /// state.
     pub environment: HashMap<OsString, OsString>,
 }
 
 impl GitSubprocessOptions {
-    pub fn from_settings(settings: &UserSettings) -> Result<Self, ConfigGetError> {
-        Ok(Self {
-            executable_path: settings.get("git.executable-path")?,
-            environment: HashMap::new(),
-        })
+    /// Creates options for the given settings. No settings affect them yet.
+    pub fn from_settings(_settings: &UserSettings) -> Result<Self, ConfigGetError> {
+        Ok(Self::default())
     }
 }
 
@@ -280,11 +272,11 @@ impl<'a: 'b, 'b> Borrow<RemoteRefSymbol<'b>> for RemoteRefKey<'a> {
 /// and error prone
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub(crate) struct RefSpec {
-    forced: bool,
+    pub(crate) forced: bool,
     // Source and destination may be fully-qualified ref name, glob pattern, or
     // object ID. The GitRefNameBuf type shouldn't be used.
-    source: Option<String>,
-    destination: String,
+    pub(crate) source: Option<String>,
+    pub(crate) destination: String,
 }
 
 impl RefSpec {
@@ -369,17 +361,6 @@ impl<'a> RefToPush<'a> {
             refspec,
             expected_location,
         }
-    }
-
-    pub(crate) fn to_git_lease(&self) -> String {
-        format!(
-            "{}:{}",
-            self.refspec.destination,
-            self.expected_location
-                .map(|x| x.to_string())
-                .as_deref()
-                .unwrap_or("")
-        )
     }
 }
 
@@ -2000,7 +1981,7 @@ pub fn create_worktree(
     if destination_is_populated {
         add_worktree_to_populated_dir(&git_ctx, destination, &branch_name)?;
     } else {
-        git_ctx.spawn_worktree_add(destination, &branch_name)?;
+        git_ctx.add_orphan_worktree(destination, &branch_name)?;
     }
 
     // Must run after the gitlink at `destination` resolves, i.e. after any
@@ -2039,12 +2020,12 @@ fn add_worktree_to_populated_dir(
     }
     let tmp_dir = TempDir::new_in(destination).map_err(GitCreateWorktreeError::TempDir)?;
     let tmp_path = tmp_dir.path();
-    git_ctx.spawn_worktree_add(tmp_path, branch_name)?;
+    git_ctx.add_orphan_worktree(tmp_path, branch_name)?;
 
     std::fs::rename(tmp_path.join(".git"), &dot_git)
         .context(&dot_git)
         .map_err(GitCreateWorktreeError::MoveGitLink)?;
-    if let Err(err) = git_ctx.spawn_worktree_repair(destination) {
+    if let Err(err) = git_ctx.repair_worktree(destination) {
         std::fs::remove_file(&dot_git).ok();
         return Err(err.into());
     }
@@ -2092,7 +2073,7 @@ pub fn unlink_worktree(
     // working directories are missing, not just the one we removed. Ideally
     // we'd target only the specific worktree.
     let git_ctx = GitSubprocessContext::from_git_backend(git_backend, subprocess_options);
-    git_ctx.spawn_worktree_prune()?;
+    git_ctx.prune_worktrees()?;
     Ok(true)
 }
 
@@ -3651,7 +3632,7 @@ impl<'a> GitFetch<'a> {
         // even more unfortunately, git errors out one refspec at a time,
         // meaning that the below cycle runs in O(#failed refspecs)
         let updates = loop {
-            let status = self.git_ctx.spawn_fetch(
+            let status = self.git_ctx.fetch(
                 remote_name,
                 &remaining_refspecs,
                 &negative_refspecs,
@@ -3704,7 +3685,7 @@ impl<'a> GitFetch<'a> {
         if try_find_active_remote_inner(&self.git_repo, remote_name).is_none() {
             return Err(GitFetchError::NoSuchRemote(remote_name.to_owned()));
         }
-        let default_branch = self.git_ctx.spawn_remote_show(remote_name)?;
+        let default_branch = self.git_ctx.default_branch(remote_name)?;
         tracing::debug!(?default_branch);
         Ok(default_branch)
     }
@@ -3928,7 +3909,7 @@ pub fn push_updates(
         .map(|full_refspec| RefToPush::new(full_refspec, &qualified_remote_refs_expected_locations))
         .collect();
 
-    let mut push_stats = git_ctx.spawn_push(remote_name, &refs_to_push, callback, options)?;
+    let mut push_stats = git_ctx.push(remote_name, &refs_to_push, callback, options)?;
     push_stats.pushed.sort();
     push_stats.rejected.sort();
     push_stats.remote_rejected.sort();

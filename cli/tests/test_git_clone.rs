@@ -1168,41 +1168,26 @@ fn test_git_clone_with_global_git_remote_config() {
 fn test_git_clone_no_git_executable() {
     let test_env = TestEnvironment::default();
     let root_dir = test_env.work_dir("");
-    test_env.add_config("git.executable-path = 'jj-test-missing-program'");
     let git_repo_path = test_env.env_root().join("source");
     let git_repo = git::init(git_repo_path);
     set_up_non_empty_git_repo(&git_repo);
 
-    let output = root_dir.run_jj(["git", "clone", "source", "clone"]);
-    insta::assert_snapshot!(output.strip_stderr_last_line(), @r#"
+    // Cloning doesn't need a `git` executable.
+    let empty_dir = test_env.env_root().join("empty-path");
+    std::fs::create_dir(&empty_dir).unwrap();
+    let output = root_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &empty_dir)
+            .args(["git", "clone", "source", "clone"])
+    });
+    insta::assert_snapshot!(output, @r#"
     ------- stderr -------
     Fetching into new repo in "$TEST_ENV/clone"
-    Error: Could not execute the git process, found in the OS path 'jj-test-missing-program'
+    bookmark: main@origin [new] tracked
+    Setting the revset alias `trunk()` to `main@origin`.
+    Working copy  (@) now at: sqpuoqvx 1ca44815 (empty) (no description set)
+    Parent commit (@-)      : qomsplrm ebeb70d8 main | message
+    Added 1 files, modified 0 files, removed 0 files
     [EOF]
-    [exit status: 1]
-    "#);
-}
-
-#[test]
-fn test_git_clone_no_git_executable_with_path() {
-    let test_env = TestEnvironment::default();
-    let root_dir = test_env.work_dir("");
-    let invalid_git_executable_path = test_env.env_root().join("invalid").join("path");
-    test_env.add_config(format!(
-        "git.executable-path = {}",
-        to_toml_value(invalid_git_executable_path.to_str().unwrap())
-    ));
-    let git_repo_path = test_env.env_root().join("source");
-    let git_repo = git::init(git_repo_path);
-    set_up_non_empty_git_repo(&git_repo);
-
-    let output = root_dir.run_jj(["git", "clone", "source", "clone"]);
-    insta::assert_snapshot!(output.strip_stderr_last_line(), @r#"
-    ------- stderr -------
-    Fetching into new repo in "$TEST_ENV/clone"
-    Error: Could not execute git process at specified path '$TEST_ENV/invalid/path'
-    [EOF]
-    [exit status: 1]
     "#);
 }
 

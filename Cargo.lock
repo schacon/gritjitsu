@@ -2079,6 +2079,7 @@ dependencies = [
  "test-case",
  "testutils",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
  "tracing",

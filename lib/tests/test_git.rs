@@ -16,6 +16,7 @@ use std::assert_matches;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::io::Write as _;
@@ -4566,6 +4567,21 @@ fn test_fetch_empty_refspecs() -> TestResult {
     Ok(())
 }
 
+/// Makes Git rewrite `old_url` to `new_url` through `GIT_CONFIG_*` variables in
+/// the options' environment.
+fn insert_url_rewrite(options: &mut GitSubprocessOptions, new_url: &Path, old_url: &Path) {
+    let mut key = OsString::from("url.");
+    key.push(new_url);
+    key.push(".insteadOf");
+    options
+        .environment
+        .insert("GIT_CONFIG_COUNT".into(), "1".into());
+    options.environment.insert("GIT_CONFIG_KEY_0".into(), key);
+    options
+        .environment
+        .insert("GIT_CONFIG_VALUE_0".into(), old_url.into());
+}
+
 #[test]
 fn test_fetch_environment_options() -> TestResult {
     let temp_dir = testutils::new_temp_dir();
@@ -4573,16 +4589,20 @@ fn test_fetch_environment_options() -> TestResult {
 
     let import_options = default_import_options();
     let mut subprocess_options = GitSubprocessOptions::from_settings(test_data.repo.settings())?;
-    let trace_path = temp_dir.path().join("git-trace.log");
-    subprocess_options
-        .environment
-        .insert("GIT_TRACE".into(), trace_path.clone().into());
+    // Redirect the remote URL to a missing repository through configuration
+    // passed in the environment.
+    let missing_path = temp_dir.path().join("missing");
+    let origin_url = test_data._temp_dir.path().join("source");
+    insert_url_rewrite(&mut subprocess_options, &missing_path, &origin_url);
 
     let mut tx = test_data.repo.start_transaction();
     let mut fetcher = GitFetch::new(tx.repo_mut(), subprocess_options, &import_options)?;
-    fetch_all_with(&mut fetcher, "origin".as_ref())?;
-
-    assert!(trace_path.exists());
+    let result = fetch_all_with(&mut fetcher, "origin".as_ref());
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("Could not find repository at '{}'", missing_path.display())
+    );
     Ok(())
 }
 
@@ -6689,11 +6709,14 @@ fn test_push_environment_options() -> TestResult {
     let setup = set_up_push_repos(&settings, &temp_dir);
     let mut tx = setup.jj_repo.start_transaction();
     let mut subprocess_options = GitSubprocessOptions::from_settings(&settings)?;
-
-    let trace_path = temp_dir.path().join("git-trace.log");
-    subprocess_options
-        .environment
-        .insert("GIT_TRACE".into(), trace_path.clone().into());
+    // Redirect the remote URL to a missing repository through configuration
+    // passed in the environment.
+    let missing_path = temp_dir.path().join("missing");
+    insert_url_rewrite(
+        &mut subprocess_options,
+        &missing_path,
+        &setup.source_repo_dir,
+    );
 
     let targets = GitPushRefTargets {
         bookmarks: vec![(
@@ -6706,16 +6729,19 @@ fn test_push_environment_options() -> TestResult {
         tags: vec![],
     };
 
-    git::push_refs(
+    let result = git::push_refs(
         tx.repo_mut(),
         subprocess_options,
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
         &GitPushOptions::default(),
-    )?;
-
-    assert!(trace_path.exists());
+    );
+    let err = result.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("Could not find repository at '{}'", missing_path.display())
+    );
     Ok(())
 }
 
