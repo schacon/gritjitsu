@@ -1,0 +1,10 @@
+bin/
+home/
+remotes/
+work/
+saved/
+results/
+results-net/
+net/
+jjconfig.toml
+gitconfig

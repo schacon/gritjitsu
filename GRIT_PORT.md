@@ -127,6 +127,12 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
   `PATH`. Test helpers and a few tests still run `git` as a reference
   implementation; jj itself never does. Tests: 3480/3480.
 
+- **Benchmarks**: `grit-bench/` compares this build against upstream jj on
+  three repos. Results and analysis are in `README.md`; the full table is in
+  `grit-bench/RESULTS.md`. The first run found grit listing loose refs twice,
+  which made every colocated command on git.git about 25 ms slower; the grit
+  fix above removed that.
+
 ### grit-lib changes
 
 | Change | Status |
@@ -138,6 +144,7 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
 | Local pushes run receive hooks and accept push options | open: gitbutlerapp/grit#2148 |
 | `WorktreeBranch::Orphan` (`git worktree add --orphan`); worktrees for bare repos | open: gitbutlerapp/grit#2149 |
 | `worktree prune` checks the recorded `.git` file, like Git | open: gitbutlerapp/grit#2150 |
+| Read each loose ref once when listing refs | branch `loose-ref-listing-once` on schacon/grit, not yet pushed |
 
 Incident: creating a PR for the CR fix force-pushed upstream `main`, because
 that branch had been created from `upstream/main` and still tracked it. The
