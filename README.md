@@ -65,8 +65,8 @@ largest single process, and `git` splits the work across several).
   stored ones, so it uses about 1.7× the CPU. Over the network to GitHub,
   clone and fetch are roughly even.
 
-The clone and catch-up rows were measured on Oct 28, after the grit-lib fixes
-in [#2217](https://github.com/gitbutlerapp/grit/pull/2217) and
+The clone and catch-up rows were measured on Oct 28, with the grit-lib fixes
+from [#2217](https://github.com/gitbutlerapp/grit/pull/2217) and
 [#2218](https://github.com/gitbutlerapp/grit/pull/2218). The other rows are
 from the full Oct 27 run, which also covers smaller repos and the network.
 Its geometric mean over 45 benchmarks was 0.80×. See
@@ -74,8 +74,10 @@ Its geometric mean over 45 benchmarks was 0.80×. See
 
 ## Changes to grit-lib
 
-The port needed these fixes and additions, developed on the
-[schacon/grit](https://github.com/schacon/grit) fork:
+The port needed these fixes and additions. They were developed on the
+[schacon/grit](https://github.com/schacon/grit) fork and are all on grit
+`main` now. Four were merged together in one integration commit
+(`4992b10ab`) and their PRs closed.
 
 | Change | Status |
 | --- | --- |
@@ -84,16 +86,16 @@ The port needed these fixes and additions, developed on the
 | `git worktree add --orphan`, and worktrees for bare repos | merged ([#2149](https://github.com/gitbutlerapp/grit/pull/2149)) |
 | `worktree prune` checks the recorded `.git` file | merged ([#2150](https://github.com/gitbutlerapp/grit/pull/2150)) |
 | Read loose ref files without an extra stat and readlink | merged ([#2194](https://github.com/gitbutlerapp/grit/pull/2194)) |
-| `detect_copies` only treats newly created files as copies | open ([#2195](https://github.com/gitbutlerapp/grit/pull/2195)) |
-| Tell the pusher when the `update` hook declines a ref | open ([#2148](https://github.com/gitbutlerapp/grit/pull/2148)) |
-| Fix "pack not found" after a repack in another repository handle | open ([#2217](https://github.com/gitbutlerapp/grit/pull/2217)) |
-| Faster local clone and fetch | open ([#2218](https://github.com/gitbutlerapp/grit/pull/2218)) |
+| `detect_copies` only treats newly created files as copies | merged ([#2195](https://github.com/gitbutlerapp/grit/pull/2195)) |
+| Tell the pusher when the `update` hook declines a ref | merged ([#2148](https://github.com/gitbutlerapp/grit/pull/2148)) |
+| Fix "pack not found" after a repack in another repository handle | merged ([#2217](https://github.com/gitbutlerapp/grit/pull/2217)) |
+| Faster local clone and fetch | merged ([#2218](https://github.com/gitbutlerapp/grit/pull/2218)) |
 
 ## Building
 
-`Cargo.toml` uses grit-lib from a local checkout at `../grit-jj/grit-lib`
-with the open changes above applied, so this repo can't be built from a
-fresh clone until they're merged.
+`Cargo.toml` pins grit-lib to a commit on
+[gitbutlerapp/grit](https://github.com/gitbutlerapp/grit) `main`, so a fresh
+clone builds with no other checkout.
 
 ```sh
 cargo build --release --bin jj

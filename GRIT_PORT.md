@@ -7,8 +7,9 @@ Goal: a jj whose only Git implementation is
 Baseline (upstream `5f0451bdd`): `cargo nextest run --workspace` gives
 3491/3491 passing.
 
-grit-lib changes live on the fork <https://github.com/schacon/grit>. Fixes and
-API additions that make sense on their own go upstream as PRs.
+grit-lib changes were developed on the fork <https://github.com/schacon/grit>
+and sent upstream as PRs. All of them are now on grit `main`, and `Cargo.toml`
+pins grit-lib to an upstream `main` commit.
 
 ## Research: what jj uses Git for
 
@@ -140,11 +141,13 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
 | `IgnorePatternList` (standalone ignore matching) | merged: gitbutlerapp/grit#2137 |
 | Strip at most one trailing CR from ignore lines | on upstream `main` (d4988e6ca, pushed directly by mistake; see below) |
 | `detect_copies` reports source modes | merged: gitbutlerapp/grit#2146 |
-| `detect_copies` only treats created paths as copy destinations | branch `detect-copies-modified-not-dest` on schacon/grit, stacked on #2146; PR after #2146 lands |
-| Local pushes run receive hooks and accept push options | open: gitbutlerapp/grit#2148 |
-| `WorktreeBranch::Orphan` (`git worktree add --orphan`); worktrees for bare repos | open: gitbutlerapp/grit#2149 |
-| `worktree prune` checks the recorded `.git` file, like Git | open: gitbutlerapp/grit#2150 |
-| Skip stat and readlink for regular loose ref files (double `refs/` walk fixed upstream as `store_bases`) | #2194 |
+| `detect_copies` only treats created paths as copy destinations | integrated: gitbutlerapp/grit#2195 (4992b10ab) |
+| Tell the pusher when the update hook declines a ref (main had since added receive hooks on local pushes) | integrated: gitbutlerapp/grit#2148 (4992b10ab) |
+| `WorktreeBranch::Orphan` (`git worktree add --orphan`); worktrees for bare repos | merged: gitbutlerapp/grit#2149 |
+| `worktree prune` checks the recorded `.git` file, like Git | merged: gitbutlerapp/grit#2150 |
+| Skip stat and readlink for regular loose ref files (double `refs/` walk fixed upstream as `store_bases`) | merged: gitbutlerapp/grit#2194 |
+| Don't trust a pack listing left by another store on the thread | integrated: gitbutlerapp/grit#2217 (4992b10ab) |
+| Faster local clone and fetch | integrated: gitbutlerapp/grit#2218 (4992b10ab) |
 
 Incident: creating a PR for the CR fix force-pushed upstream `main`, because
 that branch had been created from `upstream/main` and still tracked it. The

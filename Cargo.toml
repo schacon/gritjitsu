@@ -55,7 +55,7 @@ erased-serde = "0.4.10"
 etcetera = "0.11.0"
 eyre = "0.6"
 futures = "0.3.32"
-grit-lib = { path = "../grit-jj/grit-lib", features = ["http-ureq"] }
+grit-lib = { git = "https://github.com/gitbutlerapp/grit", rev = "78cd7ed8cc3db845c39973b6d8772188bca7e16e", features = ["http-ureq"] }
 globset = "0.4.18"
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 indexmap = { version = "2.14.0", features = ["serde"] }

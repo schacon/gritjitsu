@@ -1423,6 +1423,7 @@ dependencies = [
 [[package]]
 name = "grit-lib"
 version = "0.5.23"
+source = "git+https://github.com/gitbutlerapp/grit?rev=78cd7ed8cc3db845c39973b6d8772188bca7e16e#78cd7ed8cc3db845c39973b6d8772188bca7e16e"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
