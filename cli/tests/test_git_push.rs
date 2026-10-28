@@ -3198,7 +3198,7 @@ fn test_git_push_unmapped_refs() {
     Changes to push to origin:
       bookmark: bookmark2 [add to aa5df56a071b]
     Warning: Failed to export some bookmarks:
-      bookmark2@origin: Failed to set: cannot lock ref: 'refs/remotes/origin/bookmark2/dummy.lock' exists; cannot create 'refs/remotes/origin/bookmark2'
+      bookmark2@origin: Failed to set: cannot lock ref 'refs/remotes/origin/bookmark2': 'refs/remotes/origin/bookmark2/dummy.lock' exists; cannot create 'refs/remotes/origin/bookmark2'
     Hint: Git doesn't allow a branch/tag name that looks like a parent directory of
     another (e.g. `foo` and `foo/bar`). Try to rename the bookmarks/tags that failed
     to export or their "parent" bookmarks/tags.
@@ -3221,7 +3221,7 @@ fn test_git_push_unmapped_refs() {
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Warning: Failed to export some bookmarks:
-      bookmark2@origin: Failed to set: cannot lock ref: 'refs/remotes/origin/bookmark2/dummy.lock' exists; cannot create 'refs/remotes/origin/bookmark2'
+      bookmark2@origin: Failed to set: cannot lock ref 'refs/remotes/origin/bookmark2': 'refs/remotes/origin/bookmark2/dummy.lock' exists; cannot create 'refs/remotes/origin/bookmark2'
     [EOF]
     ");
 }
