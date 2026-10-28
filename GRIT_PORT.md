@@ -139,12 +139,12 @@ Each step is one commit on this fork, plus PRs to grit for library changes.
 | --- | --- |
 | `IgnorePatternList` (standalone ignore matching) | merged: gitbutlerapp/grit#2137 |
 | Strip at most one trailing CR from ignore lines | on upstream `main` (d4988e6ca, pushed directly by mistake; see below) |
-| `detect_copies` reports source modes | open: gitbutlerapp/grit#2146 |
+| `detect_copies` reports source modes | merged: gitbutlerapp/grit#2146 |
 | `detect_copies` only treats created paths as copy destinations | branch `detect-copies-modified-not-dest` on schacon/grit, stacked on #2146; PR after #2146 lands |
 | Local pushes run receive hooks and accept push options | open: gitbutlerapp/grit#2148 |
 | `WorktreeBranch::Orphan` (`git worktree add --orphan`); worktrees for bare repos | open: gitbutlerapp/grit#2149 |
 | `worktree prune` checks the recorded `.git` file, like Git | open: gitbutlerapp/grit#2150 |
-| Read each loose ref once when listing refs | branch `loose-ref-listing-once` on schacon/grit, not yet pushed |
+| Skip stat and readlink for regular loose ref files (double `refs/` walk fixed upstream as `store_bases`) | #2194 |
 
 Incident: creating a PR for the CR fix force-pushed upstream `main`, because
 that branch had been created from `upstream/main` and still tracked it. The

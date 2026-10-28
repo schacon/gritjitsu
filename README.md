@@ -110,12 +110,12 @@ upstream:
 | --- | --- |
 | `IgnorePatternList`: match single paths against an exclude file | merged, [gitbutlerapp/grit#2137](https://github.com/gitbutlerapp/grit/pull/2137) |
 | Strip at most one trailing CR from ignore lines | on grit `main` |
-| `detect_copies` reports source modes when no source entries are given | [#2146](https://github.com/gitbutlerapp/grit/pull/2146) |
+| `detect_copies` reports source modes when no source entries are given | on grit `main` (#2146) |
 | `detect_copies` only treats created paths as copy destinations, like `git diff -C` | branch `detect-copies-modified-not-dest`, PR after #2146 |
 | Local pushes run receive hooks and accept push options | [#2148](https://github.com/gitbutlerapp/grit/pull/2148) |
 | `git worktree add --orphan`, and worktrees for bare repos | [#2149](https://github.com/gitbutlerapp/grit/pull/2149) |
 | `worktree prune` checks the recorded `.git` file, like Git | [#2150](https://github.com/gitbutlerapp/grit/pull/2150) |
-| Read each loose ref once when listing refs (found by the benchmarks below) | branch `loose-ref-listing-once`, not yet pushed |
+| Skip stat and readlink for regular loose ref files (found by the benchmarks below; the double `refs/` walk was fixed upstream independently) | [#2194](https://github.com/gitbutlerapp/grit/pull/2194) |
 
 Known grit issue, not yet reported: `ls_remote` drops a local remote's
 `HEAD` when asked to filter for `HEAD`. jj works around it by not filtering.
@@ -226,9 +226,10 @@ within a few percent. On tiny repos there is a fixed cost of about 1 ms.
 - The cause was in grit-lib: listing loose refs walked the same `refs/`
   directory twice, reading all ~1,000 tag files twice, and it made two extra
   syscalls per file.
-- The fix is on branch `loose-ref-listing-once` in schacon/grit. It cut
-  listing from 38 ms to 15 ms, slightly faster than gitoxide, and the numbers
-  above include it.
+- The fix cut listing from 38 ms to 15 ms, slightly faster than gitoxide, and
+  the numbers above include it. grit-lib `main` has since fixed the double
+  walk independently; the syscall part is
+  [#2194](https://github.com/gitbutlerapp/grit/pull/2194).
 
 **Slower:**
 
