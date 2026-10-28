@@ -433,6 +433,7 @@ impl Repository {
             flags: RefUpdateFlags {
                 no_deref: true,
                 log_only: false,
+                ..RefUpdateFlags::default()
             },
         };
         let transaction = RefTransaction::new().update(update)?;

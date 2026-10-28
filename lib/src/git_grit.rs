@@ -124,6 +124,7 @@ pub(crate) fn ref_update(
         flags: RefUpdateFlags {
             no_deref: true,
             log_only: false,
+            ..RefUpdateFlags::default()
         },
     }
 }

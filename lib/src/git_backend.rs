@@ -39,6 +39,7 @@ use futures::io::Cursor;
 use futures::stream::BoxStream;
 use grit_lib::diff::DiffEntry;
 use grit_lib::diff::DiffStatus;
+use grit_lib::objects::FileMode;
 use grit_lib::objects::HashAlgo;
 use grit_lib::objects::ObjectId as GritObjectId;
 use grit_lib::objects::ObjectKind;
@@ -1687,8 +1688,9 @@ impl Backend for GitBackend {
             }
             // TODO: Renamed symlinks cannot be returned because CopyRecord
             // expects `source_file: FileId`.
-            let is_blob = |mode: &str| matches!(mode, "100644" | "100755");
-            if !is_blob(&change.old_mode) || !is_blob(&change.new_mode) {
+            let is_blob =
+                |mode: FileMode| mode == FileMode::REGULAR || mode == FileMode::EXECUTABLE;
+            if !is_blob(change.old_mode) || !is_blob(change.new_mode) {
                 return Ok(None);
             }
             // Empty files are too common to say anything about copies.
