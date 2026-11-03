@@ -10,11 +10,11 @@
     "astro": "astro"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.42.6",
-    "astro": "^7.1.6",
-    "astro-mermaid": "^2.1.0",
+    "@astrojs/starlight": "^0.42.7",
+    "astro": "^7.4.2",
+    "astro-mermaid": "^2.2.0",
     "js-yaml": "^5.5.0",
-    "marked": "^18.1.1",
+    "marked": "^18.1.2",
     "mdast-util-from-markdown": "^2.1.0",
     "mdast-util-gfm": "^3.1.0",
     "mermaid": "^12.2.0",
@@ -24,6 +24,6 @@
     "remark-directive": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "sharp": "^0.35.3",
-    "unist-util-visit": "^5.0.0"
+    "unist-util-visit": "^5.2.0"
   }
 }
